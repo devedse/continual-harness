@@ -295,32 +295,51 @@ class OpenAIBackend(VLMBackend):
 
     def _build_json_schema_properties(self, params: dict) -> tuple:
         """Build JSON Schema properties from Gemini-style params. Returns (properties, required)."""
-        properties = {}
-        required = params.get("required", [])
-        for prop_name, prop_def in params.get("properties", {}).items():
-            t = prop_def.get("type_", "STRING")
-            if t == "ARRAY":
-                t = "array"
-            elif t == "INTEGER":
-                t = "integer"
-            elif t == "BOOLEAN":
-                t = "boolean"
-            else:
-                t = "string"
-            prop = {"type": t, "description": prop_def.get("description", "")}
-            if t == "array" and "items" in prop_def:
-                items_t = prop_def["items"].get("type_", "STRING") if isinstance(prop_def["items"], dict) else "STRING"
-                prop["items"] = {"type": "string" if items_t == "STRING" else "string"}
-            if "enum" in prop_def:
-                prop["enum"] = prop_def["enum"]
-            properties[prop_name] = prop
-        return properties, required
+        properties = {
+            name: self._gemini_schema_to_json_schema(definition)
+            for name, definition in params.get("properties", {}).items()
+        }
+        return properties, params.get("required", [])
+
+    def _gemini_schema_to_json_schema(self, schema: dict) -> dict:
+        """Recursively convert a Gemini-style ``type_`` schema to JSON Schema."""
+        type_map = {
+            "ARRAY": "array",
+            "BOOLEAN": "boolean",
+            "INTEGER": "integer",
+            "NUMBER": "number",
+            "OBJECT": "object",
+            "STRING": "string",
+        }
+        json_type = type_map.get(str(schema.get("type_", "STRING")).upper(), "string")
+        converted = {"type": json_type}
+
+        if schema.get("description"):
+            converted["description"] = schema["description"]
+        if "enum" in schema:
+            converted["enum"] = schema["enum"]
+        if json_type == "array":
+            items = schema.get("items", {"type_": "STRING"})
+            converted["items"] = self._gemini_schema_to_json_schema(items if isinstance(items, dict) else {})
+        elif json_type == "object":
+            converted["properties"] = {
+                name: self._gemini_schema_to_json_schema(definition)
+                for name, definition in schema.get("properties", {}).items()
+            }
+            if schema.get("required"):
+                converted["required"] = schema["required"]
+
+        return converted
 
     @retry_with_exponential_backoff
     def _call_responses(self, instructions: str | None, input_data, tools: list = None):
         """Calls the Responses API (v1/responses) with optional tools.
 
-        Supports Codex and other models that require the Responses API.
+        Consume raw SSE events and return the fully populated Response carried
+        by ``response.completed``. This avoids two compatibility bugs seen with
+        llama.cpp: its non-streaming response can remain pending after generation,
+        and its ``response.created`` event omits the empty ``output`` list assumed
+        by the pinned SDK's high-level stream assembler.
         """
         kwargs = {"model": self.model_name}
         if instructions:
@@ -332,9 +351,21 @@ class OpenAIBackend(VLMBackend):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        if self._prompt_cache_key:
-            kwargs["prompt_cache_key"] = self._prompt_cache_key
-        return self.client.responses.create(**kwargs)
+        # prompt_cache_key is not supported by the repo's pinned
+        # openai==1.90.0. It is only a caching optimization.
+        stream = self.client.responses.create(**kwargs, stream=True)
+        try:
+            for event in stream:
+                event_type = getattr(event, "type", None)
+                if event_type == "response.completed":
+                    return event.response
+                if event_type in {"response.failed", "error"}:
+                    error = getattr(event, "error", None)
+                    raise RuntimeError(f"Responses stream failed: {error or event}")
+        finally:
+            stream.close()
+
+        raise RuntimeError("Responses stream ended without a response.completed event")
 
     def _prepare_image_base64(self, img: Union[Image.Image, np.ndarray]) -> str:
         """Prepare image as base64 string"""
