@@ -44,6 +44,25 @@
             color: #33ff33;
             font-size: 20px;
         }
+
+        .audio-toggle {
+            border: 1px solid #33ff33;
+            background: #0a0a0a;
+            color: #33ff33;
+            font: inherit;
+            font-size: 14px;
+            letter-spacing: 1px;
+            padding: 4px 10px;
+            margin-right: 14px;
+            cursor: pointer;
+        }
+
+        .audio-toggle:hover,
+        .audio-toggle.enabled {
+            color: #0a0a0a;
+            background: #33ff33;
+            box-shadow: 0 0 8px #33ff33;
+        }
         
         .content {
             display: flex;
@@ -689,6 +708,7 @@
         <div class="header-logo">PokeAgent Challenge //</div>
         <div class="header-title">PROTOCOL_EMERALD // AGENT = PLAYER</div>
         <div style="flex: 1;"></div>
+        <button id="audio-toggle" class="audio-toggle" type="button" aria-pressed="false">🔇 AUDIO OFF</button>
         <div id="metrics-display" style="color: #33ff33; margin-right: 20px; font-size: 14px;">
             <span id="cost-metric">Cost: $0.00</span> |
             <span id="tokens-metric">0 tokens</span> |
@@ -755,6 +775,13 @@
     <script>
         let isConnected = false;
         let frameWebSocket = null;
+        let audioWebSocket = null;
+        let audioContext = null;
+        let audioEnabled = false;
+        let audioSampleRate = 48000;
+        let audioPlaybackRate = 1;
+        let audioNode = null;
+        let audioWorkletReady = null;
         let reconnectAttempts = 0;
         const maxReconnectAttempts = 10;
 
@@ -765,9 +792,167 @@
         // WebSocket URL (use ws:// instead of http://)
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const frameWebSocketUrl = `${wsProtocol}//${window.location.hostname}:${serverPort}/ws/frames`;
+        const audioWebSocketUrl = `${wsProtocol}//${window.location.hostname}:${serverPort}/ws/audio`;
 
         console.log(`Using server URL: ${serverUrl}`);
         console.log(`Using WebSocket URL: ${frameWebSocketUrl}`);
+
+        async function initializeAudioPlayback() {
+            if (audioWorkletReady) return audioWorkletReady;
+
+            audioWorkletReady = (async () => {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: audioSampleRate,
+                    latencyHint: 'interactive'
+                });
+
+                // A continuous ring buffer avoids the tiny gaps and resampler
+                // discontinuities produced by creating one AudioBufferSourceNode
+                // for every emulator frame.
+                const processorSource = `
+                    class EmulatorPcmProcessor extends AudioWorkletProcessor {
+                        constructor() {
+                            super();
+                            this.capacity = 48000 * 3;
+                            this.left = new Float32Array(this.capacity);
+                            this.right = new Float32Array(this.capacity);
+                            this.readPosition = 0;
+                            this.writePosition = 0;
+                            this.available = 0;
+                            this.baseRate = 1;
+                            this.started = false;
+                            this.startThreshold = 4800;
+                            this.port.onmessage = event => this.handleMessage(event.data);
+                        }
+
+                        handleMessage(message) {
+                            if (message.type === 'rate') {
+                                this.baseRate = Math.max(0.25, Math.min(6, message.value || 1));
+                                return;
+                            }
+                            if (message.type === 'reset') {
+                                this.readPosition = this.writePosition;
+                                this.available = 0;
+                                this.started = false;
+                                return;
+                            }
+                            if (message.type !== 'samples') return;
+
+                            const pcm = new Int16Array(message.buffer);
+                            const frames = Math.floor(pcm.length / 2);
+                            for (let frame = 0; frame < frames; frame++) {
+                                if (this.available >= this.capacity - 1) {
+                                    this.readPosition = (this.readPosition + 1) % this.capacity;
+                                    this.available--;
+                                }
+                                this.left[this.writePosition] = pcm[frame * 2] / 32768;
+                                this.right[this.writePosition] = pcm[frame * 2 + 1] / 32768;
+                                this.writePosition = (this.writePosition + 1) % this.capacity;
+                                this.available++;
+                            }
+                        }
+
+                        process(inputs, outputs) {
+                            const output = outputs[0];
+                            const leftOut = output[0];
+                            const rightOut = output[1] || output[0];
+
+                            if (!this.started && this.available >= this.startThreshold) {
+                                this.started = true;
+                            }
+                            if (!this.started) return true;
+
+                            // Keep roughly 100 ms of source audio buffered. The
+                            // correction is deliberately tiny so it is inaudible.
+                            const target = 4800;
+                            const error = (this.available - target) / target;
+                            const correction = Math.max(0.985, Math.min(1.015, 1 + error * 0.01));
+                            const rate = this.baseRate * correction;
+
+                            for (let i = 0; i < leftOut.length; i++) {
+                                if (this.available < rate + 2) {
+                                    this.started = false;
+                                    break;
+                                }
+
+                                const index0 = Math.floor(this.readPosition) % this.capacity;
+                                const index1 = (index0 + 1) % this.capacity;
+                                const fraction = this.readPosition - Math.floor(this.readPosition);
+                                leftOut[i] = this.left[index0] + (this.left[index1] - this.left[index0]) * fraction;
+                                rightOut[i] = this.right[index0] + (this.right[index1] - this.right[index0]) * fraction;
+
+                                this.readPosition += rate;
+                                if (this.readPosition >= this.capacity) this.readPosition -= this.capacity;
+                                this.available -= rate;
+                            }
+                            return true;
+                        }
+                    }
+                    registerProcessor('emulator-pcm-processor', EmulatorPcmProcessor);
+                `;
+
+                const moduleUrl = URL.createObjectURL(new Blob([processorSource], {type: 'text/javascript'}));
+                try {
+                    await audioContext.audioWorklet.addModule(moduleUrl);
+                } finally {
+                    URL.revokeObjectURL(moduleUrl);
+                }
+
+                audioNode = new AudioWorkletNode(audioContext, 'emulator-pcm-processor', {
+                    outputChannelCount: [2]
+                });
+                audioNode.connect(audioContext.destination);
+                audioNode.port.postMessage({type: 'rate', value: audioPlaybackRate});
+            })();
+
+            return audioWorkletReady;
+        }
+
+        function connectAudioWebSocket() {
+            if (audioWebSocket && audioWebSocket.readyState <= WebSocket.OPEN) return;
+
+            audioWebSocket = new WebSocket(audioWebSocketUrl);
+            audioWebSocket.binaryType = 'arraybuffer';
+
+            audioWebSocket.onmessage = function(event) {
+                if (typeof event.data === 'string') {
+                    const message = JSON.parse(event.data);
+                    if (message.type === 'audio-config') {
+                        audioSampleRate = message.sample_rate || 48000;
+                    } else if (message.type === 'audio-rate') {
+                        audioPlaybackRate = message.playback_rate || 1;
+                        if (audioNode) {
+                            audioNode.port.postMessage({type: 'rate', value: audioPlaybackRate});
+                        }
+                    }
+                    return;
+                }
+                if (!audioEnabled || !audioNode) return;
+                audioNode.port.postMessage({type: 'samples', buffer: event.data}, [event.data]);
+            };
+
+            audioWebSocket.onclose = function() {
+                audioWebSocket = null;
+                if (audioEnabled) setTimeout(connectAudioWebSocket, 1000);
+            };
+        }
+
+        document.getElementById('audio-toggle').addEventListener('click', async function() {
+            audioEnabled = !audioEnabled;
+            this.classList.toggle('enabled', audioEnabled);
+            this.setAttribute('aria-pressed', String(audioEnabled));
+            this.textContent = audioEnabled ? '🔊 AUDIO ON' : '🔇 AUDIO OFF';
+
+            if (audioEnabled) {
+                await initializeAudioPlayback();
+                await audioContext.resume();
+                audioNode.port.postMessage({type: 'reset'});
+                connectAudioWebSocket();
+            } else if (audioContext) {
+                if (audioNode) audioNode.port.postMessage({type: 'reset'});
+                await audioContext.suspend();
+            }
+        });
 
         // WebSocket frame streaming (REAL-TIME PUSH - no polling!)
         function connectFrameWebSocket() {

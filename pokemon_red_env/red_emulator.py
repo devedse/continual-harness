@@ -94,6 +94,8 @@ RED_MILESTONES_ORDER = [
 class RedEmulator:
     """Emulator wrapper for Pokemon Red using PyBoy, matching EmeraldEmulator interface."""
 
+    AUDIO_SAMPLE_RATE = 48000
+
     def __init__(self, rom_path: str, headless: bool = True, sound: bool = False):
         self.rom_path = rom_path
         self.headless = headless
@@ -161,7 +163,15 @@ class RedEmulator:
             from pyboy import PyBoy
 
             window = "null" if self.headless else "SDL2"
-            self.pyboy = PyBoy(self.rom_path, window=window, sound=self.sound)
+            # Audio is emulated even in the null/headless window. Local speaker
+            # output stays muted; samples are consumed by the web stream.
+            self.pyboy = PyBoy(
+                self.rom_path,
+                window=window,
+                sound_volume=100 if self.sound else 0,
+                sound_emulated=True,
+                sound_sample_rate=self.AUDIO_SAMPLE_RATE,
+            )
             logger.info(f"PyBoy initialized with ROM: {self.rom_path} ({self.width}x{self.height})")
 
             # Attach memory reader
@@ -298,6 +308,22 @@ class RedEmulator:
         """Return the current frame as a numpy array."""
         img = self.get_screenshot()
         return np.array(img) if img is not None else None
+
+    def consume_audio(self) -> bytes:
+        """Return the latest PyBoy frame as stereo signed-16 PCM."""
+        if not self.pyboy:
+            return b""
+
+        try:
+            # PyBoy produces signed 8-bit stereo. Expand it to the signed-16
+            # format shared with the Emerald stream.
+            samples = np.asarray(self.pyboy.sound.ndarray, dtype=np.int16)
+            if samples.size == 0:
+                return b""
+            return np.ascontiguousarray(samples << 8, dtype="<i2").tobytes()
+        except Exception as e:
+            logger.debug(f"Failed to capture PyBoy audio: {e}")
+            return b""
 
     def start_frame_capture(self, fps: int = 30):
         """Start background thread that captures frames at *fps*."""

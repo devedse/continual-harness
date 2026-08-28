@@ -315,7 +315,7 @@ python run_cli.py --game red --backend claude --api-gateway openrouter --directi
 
 **Debug controls (with display):** M = state overlay, Shift+M = map, S = screenshot, Tab = cycle mode, Space = one agent step, 1/2 = save/load state, arrows/WASD = move, Z/X = A/B.
 
-**Web UI:** `http://localhost:8000/stream` (or your `--port`).
+**Web UI:** `http://localhost:8000/stream` (or your `--port`). Emulator audio starts muted; use the `AUDIO OFF` control in the header to enable it.
 
 ## Agent Scaffolds
 

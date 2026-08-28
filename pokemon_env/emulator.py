@@ -373,6 +373,8 @@ class MilestoneTracker:
 class EmeraldEmulator:
     """emulator wrapper for Pokémon Emerald with headless frame capture and scripted inputs."""
 
+    AUDIO_SAMPLE_RATE = 48000
+
     def __init__(self, rom_path: str, headless: bool = True, sound: bool = False):
         self.rom_path = rom_path
         self.headless = headless
@@ -387,6 +389,7 @@ class EmeraldEmulator:
         self.frame_queue = queue.Queue(maxsize=10)
         self.current_frame = None
         self.frame_thread = None
+        self.audio_buffer = None
         
         # Memory reader for accessing game state
         self.memory_reader = None
@@ -453,6 +456,13 @@ class EmeraldEmulator:
             self.video_buffer = mgba.image.Image(self.width, self.height)
             self.core.set_video_buffer(self.video_buffer)
             self.core.reset()  # Reset after setting video buffer
+
+            # mGBA exposes its stereo mixer as two blip buffers.  Keep the
+            # emulator headless, but resample those buffers to a browser-friendly
+            # rate so the web stream can consume the generated PCM audio.
+            self.core.set_audio_buffer_size(4096)
+            self.audio_buffer = self.core.get_audio_channels()
+            self.audio_buffer.set_rate(self.AUDIO_SAMPLE_RATE)
 
             # Initialize memory reader with milestone tracker for progress-based features
             self.memory_reader = PokemonEmeraldReader(self.core, milestone_tracker=self.milestone_tracker)
@@ -616,6 +626,21 @@ class EmeraldEmulator:
         except Exception as e:
             logger.error(f"Failed to get screenshot: {e}")
             return None
+
+    def consume_audio(self) -> bytes:
+        """Return all pending stereo signed-16 PCM samples."""
+        if self.audio_buffer is None:
+            return b""
+
+        try:
+            available = self.audio_buffer.available
+            if available <= 0:
+                return b""
+            samples = self.audio_buffer.read(available)
+            return np.asarray(samples, dtype="<i2").tobytes()
+        except Exception as e:
+            logger.debug(f"Failed to capture mGBA audio: {e}")
+            return b""
 
     def save_state(self, path: Optional[str] = None) -> Optional[bytes]:
         """Save current emulator state to file or return as bytes"""
