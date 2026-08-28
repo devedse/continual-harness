@@ -9,6 +9,7 @@ import base64
 import datetime
 import glob
 import io
+import itertools
 import json
 import logging
 import os
@@ -149,6 +150,8 @@ last_fps_log = time.time()
 frame_count_since_log = 0
 action_queue = []  # Queue for multi-action sequences (now stores dicts with timing info)
 current_action = None  # Current action being held
+current_action_data = None  # Queue metadata for the current action
+pending_action_data = None  # Action waiting for release frames before history completion
 action_frames_remaining = 0  # Frames left to hold current action
 release_frames_remaining = 0  # Frames left to wait after release
 current_action_release_delay = 0  # Release delay for current action
@@ -161,6 +164,10 @@ SPEED_PRESETS = {
     "slow": {"hold": 16, "release": 16},  # 32 frames total - careful inputs
 }
 DEFAULT_SPEED = "normal"
+
+# Stable identities let repeated buttons in one batch update their own history
+# entries instead of whichever matching button happens to be found first.
+action_id_counter = itertools.count(1)
 
 # Legacy constants for backward compatibility
 ACTION_HOLD_FRAMES = SPEED_PRESETS["normal"]["hold"]
@@ -766,6 +773,59 @@ def reset_game():
     print("Game and milestone reset complete")
 
 
+def _read_live_action_position():
+    """Read coordinates directly from emulator memory, bypassing state caches."""
+    if env is None:
+        return (None, None, "Unknown")
+
+    try:
+        position = env.get_player_position()
+        location = env.get_map_location() or "Unknown"
+        if position and "x" in position and "y" in position:
+            return (position["x"], position["y"], location)
+        return (None, None, location)
+    except Exception as exc:
+        logger.debug("Could not read live action position: %s", exc)
+        return (None, None, "Unknown")
+
+
+def _find_action_history_entry(action_id):
+    """Return the history entry linked to one queued action."""
+    if action_id is None:
+        return None
+    for entry in reversed(recent_button_presses):
+        if entry.get("action_id") == action_id:
+            return entry
+    return None
+
+
+def _record_action_start(action_data):
+    """Capture the real position immediately before a queued action starts."""
+    if not isinstance(action_data, dict):
+        return
+    entry = _find_action_history_entry(action_data.get("action_id"))
+    if entry is not None:
+        entry["start_pos"] = _read_live_action_position()
+
+
+def _record_action_completion(action_data):
+    """Complete the exact history entry after its final emulator frame runs."""
+    if not isinstance(action_data, dict):
+        return
+    entry = _find_action_history_entry(action_data.get("action_id"))
+    if entry is not None:
+        entry["end_pos"] = _read_live_action_position()
+        entry["completed"] = True
+
+
+def _schedule_action_completion(action_data, release_delay):
+    """Return pending/completed state for an action entering its release phase."""
+    release_delay = max(0, int(release_delay or 0))
+    if release_delay:
+        return action_data, None, release_delay
+    return None, action_data, 0
+
+
 def game_loop(manual_mode=False):
     """Main game loop - runs in main thread, always headless"""
     global running, step_count
@@ -780,8 +840,9 @@ def game_loop(manual_mode=False):
 
         # In server mode, handle action queue with proper button hold timing
         action_completed = False
+        completed_action_data = None
         if not manual_mode:
-            global current_action, action_frames_remaining, release_frames_remaining, current_action_release_delay
+            global current_action, current_action_data, pending_action_data, action_frames_remaining, release_frames_remaining, current_action_release_delay
 
             if current_action and action_frames_remaining > 0:
                 # Continue holding the current action (WAIT actions press nothing)
@@ -791,52 +852,27 @@ def game_loop(manual_mode=False):
                     actions_pressed = [current_action]
                 action_frames_remaining -= 1
                 if action_frames_remaining == 0:
-                    # Action finished, start release delay
-                    # Record ending position for this action (skip if queue is large for performance)
-                    global recent_button_presses
-
-                    # Only update position tracking if queue is small (<10 actions)
-                    # This prevents expensive state reads during batch action processing
-                    if len(action_queue) < 10:
-                        current_state = env.get_comprehensive_state()
-                        player_data = current_state.get("player", {})
-                        position = player_data.get("position", {})
-                        location = player_data.get("location", "Unknown")
-                        end_pos = (
-                            (position.get("x"), position.get("y"), location) if position else (None, None, location)
-                        )
-
-                        # Find and update the most recent incomplete action matching current_action
-                        for i in range(len(recent_button_presses) - 1, -1, -1):
-                            if (
-                                recent_button_presses[i]["button"] == current_action
-                                and not recent_button_presses[i]["completed"]
-                            ):
-                                recent_button_presses[i]["end_pos"] = end_pos
-                                recent_button_presses[i]["completed"] = True
-                                break
-                    else:
-                        # For large queues, just mark as completed without position update
-                        for i in range(len(recent_button_presses) - 1, -1, -1):
-                            if (
-                                recent_button_presses[i]["button"] == current_action
-                                and not recent_button_presses[i]["completed"]
-                            ):
-                                recent_button_presses[i]["end_pos"] = (None, None, "Unknown")
-                                recent_button_presses[i]["completed"] = True
-                                break
-
+                    # Coordinates settle during the release frames, so defer the
+                    # end-position read until that release period finishes.
+                    pending_action_data, completed_action_data, release_frames_remaining = (
+                        _schedule_action_completion(current_action_data, current_action_release_delay)
+                    )
+                    action_completed = completed_action_data is not None
                     current_action = None
-                    release_frames_remaining = current_action_release_delay
-                    action_completed = True  # Mark action as completed
-                    print(f"✅ Action completed: step_count will increment")
+                    current_action_data = None
             elif release_frames_remaining > 0:
                 # Release delay (no button pressed)
                 actions_pressed = []
                 release_frames_remaining -= 1
+                if release_frames_remaining == 0:
+                    completed_action_data = pending_action_data
+                    pending_action_data = None
+                    action_completed = True
+                    print(f"✅ Action completed: step_count will increment")
             elif action_queue:
                 # Start a new action from the queue
                 current_action_data = action_queue.pop(0)
+                _record_action_start(current_action_data)
 
                 # Handle both old format (string) and new format (dict) for backward compatibility
                 if isinstance(current_action_data, str):
@@ -856,14 +892,21 @@ def game_loop(manual_mode=False):
                         timing["release"] = current_action_data["release_frames"]
 
                 # Special handling for WAIT action
-                if current_action == "WAIT":
+                is_wait_action = current_action == "WAIT"
+                if is_wait_action:
                     action_frames_remaining = 0  # Don't actually hold any button
                     current_action_release_delay = timing["release"]  # Wait duration is in release
+                    pending_action_data, completed_action_data, release_frames_remaining = (
+                        _schedule_action_completion(current_action_data, current_action_release_delay)
+                    )
+                    current_action = None
+                    current_action_data = None
+                    action_completed = completed_action_data is not None
                 else:
                     action_frames_remaining = timing["hold"]
                     current_action_release_delay = timing["release"]
 
-                actions_pressed = [] if current_action == "WAIT" else [current_action]
+                actions_pressed = [] if is_wait_action else [current_action]
                 queue_len = len(action_queue)
 
                 # Get current FPS for estimation
@@ -879,6 +922,9 @@ def game_loop(manual_mode=False):
 
         # Step environment
         step_environment(actions_pressed)
+
+        if completed_action_data is not None:
+            _record_action_completion(completed_action_data)
 
         # Milestones are now updated in background thread
 
@@ -1118,44 +1164,20 @@ async def take_action(request: ActionRequest):
             print(f"📡 Server received actions: {request.buttons}{speed_info}{frame_info}")
             print(f"📋 Action queue before extend: {action_queue}")
 
-            # Create action data with timing info
-            for button in request.buttons:
-                action_data = {
-                    "button": button,
-                    "speed": speed,
-                    "hold_frames": hold_frames,
-                    "release_frames": release_frames,
-                }
-                action_queue.append(action_data)
-
-            print(f"📋 Action queue after extend: {len(action_queue)} actions")
-
-            # Track button presses for recent actions display with position tracking
+            # Create one-to-one queue/history records. Coordinates are captured
+            # later at the actual start and completion of each individual action.
             current_time = time.time()
-
-            # Only read position if queue is small (<20 actions) to avoid performance impact
-            # For large queues, skip position tracking to maintain FPS
-            if len(action_queue) < 20:
-                # Get current player position (use cached state - 100ms cache in emulator)
-                current_state = env.get_comprehensive_state()  # Already cached internally
-                player_data = current_state.get("player", {})
-                position = player_data.get("position", {})
-                location = player_data.get("location", "Unknown")
-                start_pos = (position.get("x"), position.get("y"), location) if position else (None, None, location)
-            else:
-                # Skip expensive state read for large queues
-                start_pos = (None, None, "Unknown")
-
             source = request.source
             metadata = request.metadata or {}
             sequence_length = len(request.buttons)
 
             for idx, button in enumerate(request.buttons):
-                # Add all buttons to recent actions with starting position
+                action_id = next(action_id_counter)
                 action_entry = {
+                    "action_id": action_id,
                     "button": button,
                     "timestamp": current_time,
-                    "start_pos": start_pos,
+                    "start_pos": None,
                     "end_pos": None,  # Will be filled when action completes
                     "completed": False,
                     "sequence_index": idx,
@@ -1168,6 +1190,17 @@ async def take_action(request: ActionRequest):
                     action_entry["metadata"] = dict(metadata)
 
                 recent_button_presses.append(action_entry)
+                action_queue.append(
+                    {
+                        "action_id": action_id,
+                        "button": button,
+                        "speed": speed,
+                        "hold_frames": hold_frames,
+                        "release_frames": release_frames,
+                    }
+                )
+
+            print(f"📋 Action queue after extend: {len(action_queue)} actions")
 
             # Update total actions count in metrics
             with step_lock:
