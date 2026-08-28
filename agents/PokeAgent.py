@@ -1811,23 +1811,35 @@ class PokeAgent:
                         return self.vlm.get_query(image, prompt, orchestrator_interaction_name)
 
                     logger.info(f"📡 Calling VLM API with image (prompt: {len(prompt)} chars, image: {len(screenshot_b64)} bytes)")
-                    logger.info(f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - timeout set to 6000s...")
+                    if self.backend == "openai":
+                        logger.info(
+                            f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - "
+                            "OpenAI idle-read timeout 6000s; no generation wall timeout..."
+                        )
+                    else:
+                        logger.info(
+                            f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - timeout set to 6000s..."
+                        )
 
-                    max_retries = 3
+                    max_retries = 1 if self.backend == "openai" else 3
                     retry_count = 0
                     response = None
 
                     while retry_count < max_retries:
-                        executor = ThreadPoolExecutor(max_workers=1)
+                        executor = None
                         future = None
                         try:
-                            future = executor.submit(call_vlm_with_image)
-                            # 600s outer wall must be >= the inner SDK deadline in
-                            # vlm_backends.GeminiBackend._call_generate_content (also 600s
-                            # for pro-preview thinking models). Anything smaller would
-                            # silently truncate slow calls and leak ghost worker threads
-                            # whose responses get logged but never used by the agent.
-                            response = future.result(timeout=6000)
+                            # OpenAI owns its idle-read timeout and has no outer
+                            # generation wall, so call it synchronously. This also
+                            # lets Ctrl+C close the stream instead of leaving an
+                            # abandoned worker request behind. Other backends retain
+                            # the existing 6000-second outer safety limit.
+                            if self.backend == "openai":
+                                response = call_vlm_with_image()
+                            else:
+                                executor = ThreadPoolExecutor(max_workers=1)
+                                future = executor.submit(call_vlm_with_image)
+                                response = future.result(timeout=6000)
                             vlm_duration = time.time() - vlm_call_start
                             logger.info(f"   ✅ VLM call completed in {vlm_duration:.1f}s (attempt {retry_count + 1}/{max_retries})")
                             break
@@ -1840,7 +1852,8 @@ class PokeAgent:
                                 logger.error(f"   ❌ Max retries ({max_retries}) reached - giving up")
                                 raise TimeoutError(f"VLM call timed out after {max_retries} attempts")
                         finally:
-                            executor.shutdown(wait=False)
+                            if executor is not None:
+                                executor.shutdown(wait=False)
                 else:
                     claimed_step = self.runtime.claim_step(
                         owner="orchestrator",
@@ -1851,23 +1864,35 @@ class PokeAgent:
                         return self.vlm.get_text_query(prompt, orchestrator_interaction_name)
 
                     logger.info(f"📡 Calling VLM API with text only (prompt: {len(prompt)} chars)")
-                    logger.info(f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - timeout set to 6000s...")
+                    if self.backend == "openai":
+                        logger.info(
+                            f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - "
+                            "OpenAI idle-read timeout 6000s; no generation wall timeout..."
+                        )
+                    else:
+                        logger.info(
+                            f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - timeout set to 6000s..."
+                        )
 
-                    max_retries = 3
+                    max_retries = 1 if self.backend == "openai" else 3
                     retry_count = 0
                     response = None
 
                     while retry_count < max_retries:
-                        executor = ThreadPoolExecutor(max_workers=1)
+                        executor = None
                         future = None
                         try:
-                            future = executor.submit(call_vlm_with_text)
-                            # 600s outer wall must be >= the inner SDK deadline in
-                            # vlm_backends.GeminiBackend._call_generate_content (also 600s
-                            # for pro-preview thinking models). Anything smaller would
-                            # silently truncate slow calls and leak ghost worker threads
-                            # whose responses get logged but never used by the agent.
-                            response = future.result(timeout=6000)
+                            # OpenAI owns its idle-read timeout and has no outer
+                            # generation wall, so call it synchronously. This also
+                            # lets Ctrl+C close the stream instead of leaving an
+                            # abandoned worker request behind. Other backends retain
+                            # the existing 6000-second outer safety limit.
+                            if self.backend == "openai":
+                                response = call_vlm_with_text()
+                            else:
+                                executor = ThreadPoolExecutor(max_workers=1)
+                                future = executor.submit(call_vlm_with_text)
+                                response = future.result(timeout=6000)
                             vlm_duration = time.time() - vlm_call_start
                             logger.info(f"   ✅ VLM call completed in {vlm_duration:.1f}s (attempt {retry_count + 1}/{max_retries})")
                             break
@@ -1880,7 +1905,8 @@ class PokeAgent:
                                 logger.error(f"   ❌ Max retries ({max_retries}) reached - giving up")
                                 raise TimeoutError(f"VLM call timed out after {max_retries} attempts")
                         finally:
-                            executor.shutdown(wait=False)
+                            if executor is not None:
+                                executor.shutdown(wait=False)
 
                 is_function_calling = hasattr(response, 'candidates')
                 

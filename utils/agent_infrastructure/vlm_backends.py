@@ -235,7 +235,7 @@ class OpenAIBackend(VLMBackend):
     def __init__(self, model_name: str, tools: list = None, system_instruction: str = None, **kwargs):
         try:
             import openai
-            from openai import OpenAI
+            from openai import OpenAI, Timeout
         except ImportError:
             raise ImportError("OpenAI package not found. Install with: pip install openai")
 
@@ -248,8 +248,17 @@ class OpenAIBackend(VLMBackend):
         if not self.api_key:
             raise ValueError("Error: OpenAI API key is missing! Set OPENAI_API_KEY environment variable.")
 
-        self.client = OpenAI(api_key=self.api_key)
-        self.errors = (openai.RateLimitError,)
+        # llama.cpp can legitimately spend far longer than the SDK's default
+        # 600-second idle-read window on a single response.  Keep connection
+        # setup bounded, while allowing 6000 seconds of idle read time.
+        # SDK retries are disabled because this backend owns retry policy and a
+        # transparent retry can submit the same expensive generation twice.
+        self.client = OpenAI(
+            api_key=self.api_key,
+            timeout=Timeout(6000.0, connect=10.0),
+            max_retries=0,
+        )
+        self._openai_module = openai
 
         if self.tools:
             self._tools_openai = self._convert_tools_to_openai_format()
@@ -367,7 +376,6 @@ class OpenAIBackend(VLMBackend):
 
         return converted
 
-    @retry_with_exponential_backoff
     def _call_responses(self, instructions: str | None, input_data, tools: list = None):
         """Calls the Responses API (v1/responses) with optional tools.
 
@@ -389,7 +397,7 @@ class OpenAIBackend(VLMBackend):
             kwargs["tool_choice"] = "auto"
         # prompt_cache_key is not supported by the repo's pinned
         # openai==1.90.0. It is only a caching optimization.
-        stream = self.client.responses.create(**kwargs, stream=True)
+        stream = self._open_responses_stream(kwargs)
         try:
             for event in stream:
                 event_type = getattr(event, "type", None)
@@ -402,6 +410,54 @@ class OpenAIBackend(VLMBackend):
             stream.close()
 
         raise RuntimeError("Responses stream ended without a response.completed event")
+
+    def _open_responses_stream(self, kwargs: dict):
+        """Open an SSE stream, retrying only failures before streaming starts.
+
+        Once a stream has been returned, failures are deliberately not retried:
+        the server may already have spent substantial time generating, and
+        resubmitting would duplicate that work.
+        """
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self.client.responses.create(**kwargs, stream=True)
+            except Exception as exc:
+                if attempt >= max_attempts or not self._is_retryable_responses_open_error(exc):
+                    raise
+                delay = min(2 ** (attempt - 1), 10)
+                logger.warning(
+                    "OpenAI Responses connection failed before streaming (%s); "
+                    "retrying in %ss (%d/%d)",
+                    type(exc).__name__,
+                    delay,
+                    attempt,
+                    max_attempts,
+                )
+                time.sleep(delay)
+
+    def _is_retryable_responses_open_error(self, exc: Exception) -> bool:
+        """Return whether a pre-stream failure is safe and useful to retry."""
+        openai_module = getattr(self, "_openai_module", None)
+        if openai_module is None:
+            return False
+
+        timeout_type = getattr(openai_module, "APITimeoutError", None)
+        if timeout_type is not None and isinstance(exc, timeout_type):
+            # A 6000-second idle timeout is not an outage signal and retrying
+            # would duplicate a potentially completed generation.
+            return False
+
+        connection_type = getattr(openai_module, "APIConnectionError", None)
+        if connection_type is not None and isinstance(exc, connection_type):
+            return True
+
+        status_type = getattr(openai_module, "APIStatusError", None)
+        if status_type is not None and isinstance(exc, status_type):
+            status_code = getattr(exc, "status_code", None)
+            return status_code in {408, 409, 429} or (status_code is not None and status_code >= 500)
+
+        return False
 
     def _prepare_image_base64(self, img: Union[Image.Image, np.ndarray]) -> str:
         """Prepare image as base64 string"""

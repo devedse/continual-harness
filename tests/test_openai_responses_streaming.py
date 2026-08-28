@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from agents.tools.registry import TOOL_REGISTRY
 from utils.agent_infrastructure.vlm_backends import OpenAIBackend
@@ -14,6 +15,18 @@ class _FakeResponseStream:
 
     def close(self):
         self.closed = True
+
+
+def test_openai_client_uses_long_timeout_without_sdk_retries():
+    with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch("openai.OpenAI") as client_cls:
+        OpenAIBackend("test-model")
+
+    client_cls.assert_called_once()
+    kwargs = client_cls.call_args.kwargs
+    assert kwargs["api_key"] == "test-key"
+    assert kwargs["max_retries"] == 0
+    assert kwargs["timeout"].connect == 10.0
+    assert kwargs["timeout"].read == 6000.0
 
 
 def test_call_responses_streams_and_returns_assembled_final_response():
@@ -77,6 +90,78 @@ def test_call_responses_streams_text_input_without_tools():
     assert backend._call_responses(None, "hello") is expected
     assert calls == [{"model": "test-model", "input": "hello", "stream": True}]
     assert response_stream.closed
+
+
+def test_stream_open_retries_only_before_stream_is_returned():
+    expected = object()
+    response_stream = _FakeResponseStream(
+        [SimpleNamespace(type="response.completed", response=expected)]
+    )
+    create = Mock(side_effect=[ConnectionError("server down"), response_stream])
+
+    backend = OpenAIBackend.__new__(OpenAIBackend)
+    backend.model_name = "test-model"
+    backend.client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    backend._is_retryable_responses_open_error = Mock(return_value=True)
+
+    with patch("utils.agent_infrastructure.vlm_backends.time.sleep") as sleep:
+        result = backend._call_responses(None, "hello")
+
+    assert result is expected
+    assert create.call_count == 2
+    sleep.assert_called_once_with(1)
+
+
+def test_stream_iteration_failure_is_not_resubmitted():
+    class BrokenStream:
+        def __init__(self):
+            self.closed = False
+
+        def __iter__(self):
+            raise ConnectionError("stream disconnected")
+
+        def close(self):
+            self.closed = True
+
+    stream = BrokenStream()
+    create = Mock(return_value=stream)
+    backend = OpenAIBackend.__new__(OpenAIBackend)
+    backend.model_name = "test-model"
+    backend.client = SimpleNamespace(responses=SimpleNamespace(create=create))
+
+    try:
+        backend._call_responses(None, "hello")
+    except ConnectionError as exc:
+        assert str(exc) == "stream disconnected"
+    else:
+        raise AssertionError("Expected the stream disconnect to propagate")
+
+    create.assert_called_once()
+    assert stream.closed
+
+
+def test_retry_classification_excludes_long_read_timeouts():
+    class FakeTimeout(Exception):
+        pass
+
+    class FakeConnection(Exception):
+        pass
+
+    class FakeStatus(Exception):
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    backend = OpenAIBackend.__new__(OpenAIBackend)
+    backend._openai_module = SimpleNamespace(
+        APITimeoutError=FakeTimeout,
+        APIConnectionError=FakeConnection,
+        APIStatusError=FakeStatus,
+    )
+
+    assert backend._is_retryable_responses_open_error(FakeTimeout()) is False
+    assert backend._is_retryable_responses_open_error(FakeConnection()) is True
+    assert backend._is_retryable_responses_open_error(FakeStatus(503)) is True
+    assert backend._is_retryable_responses_open_error(FakeStatus(400)) is False
 
 
 def test_openai_tool_schema_preserves_array_items_that_are_objects():
