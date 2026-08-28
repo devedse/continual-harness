@@ -4,6 +4,7 @@
 *.log
 *.gba
 *.gbc
+PokemonRed-GBC/*.zip
 *.pem
 *.gba
 llm_log_*
