@@ -9,10 +9,12 @@ import json
 import logging
 import os
 import shutil
-from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Dict, Generic, List, Optional, Protocol, TypeVar
+
+from filelock import FileLock
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +70,39 @@ class BaseStore(Generic[T]):
 
         self.cache_dir = cache_dir
         self.store_file = os.path.join(cache_dir, self.file_name)
+        self.lock_file = f"{self.store_file}.lock"
         os.makedirs(cache_dir, exist_ok=True)
 
         self.entries: Dict[str, T] = {}
         self.next_id: int = 1
         self._cached_tree: Optional[str] = None
         self._recent_access_ids: set = set()
+        self._file_signature: Optional[tuple[int, int]] = None
+
+    def _get_file_signature(self) -> Optional[tuple[int, int]]:
+        try:
+            stat = os.stat(self.store_file)
+            return (stat.st_mtime_ns, stat.st_size)
+        except FileNotFoundError:
+            return None
+
+    @contextmanager
+    def _file_lock(self):
+        """Serialize mutations made by the separate agent and server processes."""
+        with FileLock(self.lock_file, timeout=30):
+            yield
+
+    def reload_if_changed(self, *, force: bool = False) -> bool:
+        """Refresh this process-local cache when another process changed the file."""
+        signature = self._get_file_signature()
+        if not force and signature == self._file_signature:
+            return False
+        with self._file_lock():
+            signature = self._get_file_signature()
+            if not force and signature == self._file_signature:
+                return False
+            self._load_unlocked()
+        return True
 
     # ------------------------------------------------------------------
     # CRUD
@@ -86,22 +115,24 @@ class BaseStore(Generic[T]):
         used as-is (allows human-readable IDs like ``"move_to_coords"``).
         Otherwise a numeric ID is auto-generated.
         """
-        custom_id = fields.get("id")
-        if custom_id and custom_id not in self.entries:
-            entry_id = custom_id
-        else:
-            entry_id = f"{self.id_prefix}{self.next_id:04d}"
-            self.next_id += 1
+        with self._file_lock():
+            self._load_unlocked()
+            custom_id = fields.get("id")
+            if custom_id and custom_id not in self.entries:
+                entry_id = custom_id
+            else:
+                entry_id = f"{self.id_prefix}{self.next_id:04d}"
+                self.next_id += 1
 
-        fields["id"] = entry_id
-        fields.setdefault("created_at", datetime.now().isoformat())
-        fields.setdefault("updated_at", fields["created_at"])
-        fields.setdefault("mutation_history", [])
+            fields["id"] = entry_id
+            fields.setdefault("created_at", datetime.now().isoformat())
+            fields.setdefault("updated_at", fields["created_at"])
+            fields.setdefault("mutation_history", [])
 
-        entry = self.entry_class(**fields)
-        self.entries[entry_id] = entry
-        self._invalidate_cache()
-        self.save()
+            entry = self.entry_class(**fields)
+            self.entries[entry_id] = entry
+            self._invalidate_cache()
+            self._save_unlocked()
 
         title = getattr(entry, "title", "") or getattr(entry, "name", "")
         logger.info(f"Added {self.id_prefix}entry: {entry_id} ({title})")
@@ -109,41 +140,46 @@ class BaseStore(Generic[T]):
 
     def update(self, entry_id: str, **fields) -> bool:
         """Update fields on an existing entry. Returns False if not found."""
-        if entry_id not in self.entries:
-            logger.warning(f"Entry {entry_id} not found for update")
-            return False
+        with self._file_lock():
+            self._load_unlocked()
+            if entry_id not in self.entries:
+                logger.warning(f"Entry {entry_id} not found for update")
+                return False
 
-        entry = self.entries[entry_id]
-        changed: Dict[str, Any] = {}
-        for key, value in fields.items():
-            if value is not None and hasattr(entry, key) and key != "mutation_history":
-                old = getattr(entry, key)
-                if old != value:
-                    changed[key] = {"old": old, "new": value}
-                setattr(entry, key, value)
+            entry = self.entries[entry_id]
+            changed: Dict[str, Any] = {}
+            for key, value in fields.items():
+                if value is not None and hasattr(entry, key) and key != "mutation_history":
+                    old = getattr(entry, key)
+                    if old != value:
+                        changed[key] = {"old": old, "new": value}
+                    setattr(entry, key, value)
 
-        now = datetime.now().isoformat()
-        if changed and hasattr(entry, "mutation_history"):
-            entry.mutation_history.append({"timestamp": now, "fields": changed})  # type: ignore[attr-defined]
+            now = datetime.now().isoformat()
+            if changed and hasattr(entry, "mutation_history"):
+                entry.mutation_history.append({"timestamp": now, "fields": changed})  # type: ignore[attr-defined]
 
-        entry.updated_at = now  # type: ignore[attr-defined]
-        self._invalidate_cache()
-        self.save()
+            entry.updated_at = now  # type: ignore[attr-defined]
+            self._invalidate_cache()
+            self._save_unlocked()
         logger.info(f"Updated entry: {entry_id}")
         return True
 
     def remove(self, entry_id: str) -> bool:
         """Delete an entry. Returns False if not found."""
-        if entry_id not in self.entries:
-            return False
-        del self.entries[entry_id]
-        self._invalidate_cache()
-        self.save()
+        with self._file_lock():
+            self._load_unlocked()
+            if entry_id not in self.entries:
+                return False
+            del self.entries[entry_id]
+            self._invalidate_cache()
+            self._save_unlocked()
         logger.info(f"Removed entry: {entry_id}")
         return True
 
     def get(self, entry_id: str) -> Optional[T]:
         """Look up by ID first, then fall back to name/title match."""
+        self.reload_if_changed()
         entry = self.entries.get(entry_id)
         if entry is not None:
             self._recent_access_ids.add(entry_id)
@@ -160,6 +196,7 @@ class BaseStore(Generic[T]):
 
     def get_multiple(self, ids: List[str], max_count: int = 3) -> List[T]:
         """Return up to *max_count* entries by ID (order preserved)."""
+        self.reload_if_changed()
         results: List[T] = []
         for eid in ids[:max_count]:
             entry = self.entries.get(eid)
@@ -169,13 +206,15 @@ class BaseStore(Generic[T]):
         return results
 
     def get_all(self) -> List[T]:
+        self.reload_if_changed()
         return list(self.entries.values())
 
     def clear(self) -> None:
-        self.entries.clear()
-        self.next_id = 1
-        self._invalidate_cache()
-        self.save()
+        with self._file_lock():
+            self.entries.clear()
+            self.next_id = 1
+            self._invalidate_cache()
+            self._save_unlocked()
         logger.info(f"Cleared {self.store_label} store")
 
     # ------------------------------------------------------------------
@@ -197,6 +236,7 @@ class BaseStore(Generic[T]):
             events:
               - [mem_0003] Received Pokedex
         """
+        self.reload_if_changed()
         if self._cached_tree is not None:
             return self._cached_tree
 
@@ -304,24 +344,42 @@ class BaseStore(Generic[T]):
         return d
 
     def save(self) -> None:
+        with self._file_lock():
+            self._save_unlocked()
+
+    def _save_unlocked(self) -> None:
         try:
             data = {
                 "next_id": self.next_id,
                 "entries": {eid: self._serialize_entry(e) for eid, e in self.entries.items()},
             }
-            with open(self.store_file, "w", encoding="utf-8") as f:
+            temporary = f"{self.store_file}.{os.getpid()}.tmp"
+            with open(temporary, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, self.store_file)
+            self._file_signature = self._get_file_signature()
             logger.debug(f"Saved {len(self.entries)} {self.store_label} entries")
         except Exception as e:
             logger.error(f"Failed to save {self.store_label}: {e}")
 
     def load(self) -> None:
+        with self._file_lock():
+            self._load_unlocked()
+
+    def _load_unlocked(self) -> None:
+        self.entries = {}
+        self.next_id = 1
+        self._invalidate_cache()
         if not os.path.exists(self.store_file):
+            self._file_signature = None
             logger.info(f"No existing {self.file_name} found, starting fresh")
             return
 
         try:
             if os.path.getsize(self.store_file) == 0:
+                self._file_signature = self._get_file_signature()
                 logger.info(f"{self.file_name} is empty, starting fresh")
                 return
 
@@ -333,11 +391,13 @@ class BaseStore(Generic[T]):
                 entry = self._deserialize_entry(entry_dict)
                 self.entries[entry_id] = entry
 
+            self._file_signature = self._get_file_signature()
             logger.info(f"Loaded {len(self.entries)} {self.store_label} entries")
         except json.JSONDecodeError as e:
             logger.warning(f"{self.file_name} contains invalid JSON: {e}. Starting fresh.")
             self.next_id = 1
             self.entries = {}
+            self._file_signature = self._get_file_signature()
         except Exception as e:
             logger.error(f"Failed to load {self.store_label}: {e}")
 

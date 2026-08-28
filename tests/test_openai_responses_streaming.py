@@ -91,3 +91,18 @@ def test_openai_tool_schema_preserves_array_items_that_are_objects():
     assert entries["items"]["type"] == "object"
     assert entries["items"]["properties"]["importance"]["type"] == "integer"
     assert entries["items"]["properties"]["content"]["type"] == "string"
+
+
+def test_openai_process_skill_schema_requires_action_specific_fields():
+    process_skill = next(tool for tool in TOOL_REGISTRY if tool["name"] == "process_skill")
+    backend = OpenAIBackend.__new__(OpenAIBackend)
+    backend.tools = [process_skill]
+
+    parameters = backend._convert_tools_to_openai_format()[0]["parameters"]
+
+    add_rule, existing_entry_rule = parameters["allOf"]
+    add_item = add_rule["then"]["properties"]["entries"]["items"]
+    existing_item = existing_entry_rule["then"]["properties"]["entries"]["items"]
+    assert add_item["required"] == ["name", "description"]
+    assert add_item["properties"]["description"]["minLength"] == 1
+    assert existing_item["required"] == ["id"]

@@ -284,12 +284,48 @@ class OpenAIBackend(VLMBackend):
         for tool in self.tools:
             params = tool.get("parameters", {})
             properties, required = self._build_json_schema_properties(params)
+            parameters = {"type": "object", "properties": properties, "required": required}
+            if tool.get("name") == "process_skill":
+                parameters["allOf"] = [
+                    {
+                        "if": {
+                            "properties": {"action": {"const": "add"}},
+                            "required": ["action"],
+                        },
+                        "then": {
+                            "properties": {
+                                "entries": {
+                                    "items": {
+                                        "required": ["name", "description"],
+                                        "properties": {
+                                            "name": {"type": "string", "minLength": 1},
+                                            "description": {"type": "string", "minLength": 1},
+                                        },
+                                    }
+                                }
+                            }
+                        },
+                    },
+                    {
+                        "if": {
+                            "properties": {
+                                "action": {"enum": ["read", "update", "delete"]}
+                            },
+                            "required": ["action"],
+                        },
+                        "then": {
+                            "properties": {
+                                "entries": {"items": {"required": ["id"]}}
+                            }
+                        },
+                    },
+                ]
             # Responses API: flat format with name/description/parameters at top level
             result.append({
                 "type": "function",
                 "name": tool["name"],
                 "description": tool.get("description", ""),
-                "parameters": {"type": "object", "properties": properties, "required": required},
+                "parameters": parameters,
             })
         return result
 

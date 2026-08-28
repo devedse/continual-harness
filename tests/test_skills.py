@@ -95,6 +95,30 @@ class TestSkillStore:
         assert "mutation_history" not in dd
         assert dd["name"] == "Vis"
 
+    def test_reader_refreshes_after_another_process_updates_skill(self, tmp_path):
+        writer = SkillStore(cache_dir=str(tmp_path))
+        writer.add(
+            id="navigate_bfs",
+            name="Navigate",
+            description="Navigate on the current map",
+            code="result = 'old'",
+        )
+        reader = SkillStore(cache_dir=str(tmp_path))
+
+        writer.update("navigate_bfs", code="result = 'repaired'")
+
+        assert reader.get("navigate_bfs").code == "result = 'repaired'"
+
+    def test_stale_writer_does_not_overwrite_other_process_addition(self, tmp_path):
+        first_process = SkillStore(cache_dir=str(tmp_path))
+        second_process = SkillStore(cache_dir=str(tmp_path))
+
+        first_process.add(id="first", name="First", description="First skill")
+        second_process.add(id="second", name="Second", description="Second skill")
+
+        reloaded = SkillStore(cache_dir=str(tmp_path))
+        assert set(reloaded.entries) == {"first", "second"}
+
 
 # ---------------------------------------------------------------------------
 # Global singleton

@@ -216,7 +216,7 @@ class PokeAgent:
         self.conversation_history = []
 
         # Recent function call results to add to next step's context
-        # Format: [(function_name, result_json_string, timestamp), ...]
+        # Format: [{"function_name": str, "result": str, "timestamp": float}, ...]
         self.recent_function_results = []
         self._subagent_vlm_cache: OrderedDict[Tuple, Any] = OrderedDict()
         self._VLM_CACHE_CAP = 10
@@ -336,7 +336,7 @@ class PokeAgent:
 
             state = load_agent_state(get_cache_directory(), history_limit=20)
             self.conversation_history = list(state.get("conversation_history") or [])[-20:]
-            self.recent_function_results = [tuple(item) for item in state.get("recent_function_results") or []]
+            self.recent_function_results = list(state.get("recent_function_results") or [])
             self.runtime.sync_step(int(state.get("step_count") or 0))
             logger.info(
                 "🔄 Restored agent state from %s: step=%d, history=%d",
@@ -355,7 +355,7 @@ class PokeAgent:
             "conversation_history": self.conversation_history[-20:],
             "recent_function_results": list(self.recent_function_results),
         }
-    
+
     def _load_base_prompt(self) -> str:
         """Load base prompt (strategic guidance) from file.
         
@@ -482,32 +482,11 @@ class PokeAgent:
                     skill_args = {"x": int(x), "y": int(y)}
                     logger.info(f"Extracted args from reasoning: {skill_args}")
 
-        if not skill_args:
-            return json.dumps({
-                "success": False,
-                "error": (
-                    f"Skill {skill_id} ({entry.name}) requires arguments in the 'args' field. "
-                    f"You passed empty args. Example: run_skill(skill_id='{skill_id}', "
-                    f"args={{\"x\": 5, \"y\": 3}}, reasoning='...'). "
-                    f"The 'args' parameter must be a JSON object with the values the skill code needs."
-                ),
-            })
-
         # Build a tools dict that skill code can call
-        def _tool_caller(tool_name):
-            def call(**kwargs):
-                result = self.mcp_adapter.call_tool(tool_name, kwargs)
-                # After pressing buttons, wait for the emulator to process them
-                # so subsequent get_game_state() calls return updated positions
-                if tool_name == "press_buttons":
-                    self._wait_for_actions_complete()
-                return result
-            return call
-
         sandbox_tools = {}
         for tool_name in ("press_buttons", "get_game_state", "get_map_data", "complete_direct_objective",
                           "process_memory"):
-            sandbox_tools[tool_name] = _tool_caller(tool_name)
+            sandbox_tools[tool_name] = self._make_sandbox_tool_caller(tool_name)
 
         import random, collections, math, json as _json_mod, re as _re_mod, heapq, itertools, functools
         import numpy as np
@@ -520,6 +499,9 @@ class PokeAgent:
                 "max": max, "sum": sum, "enumerate": enumerate, "zip": zip,
                 "sorted": sorted, "reversed": reversed, "isinstance": isinstance,
                 "map": map, "filter": filter, "any": any, "all": all,
+                "repr": repr,
+                "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
+                "KeyError": KeyError, "IndexError": IndexError,
                 "__import__": __import__,
                 "True": True, "False": False, "None": None,
             },
@@ -541,14 +523,64 @@ class PokeAgent:
         logger.info(f"  Skill code length: {len(code)} chars, args: {skill_args}")
 
         try:
-            exec(code, sandbox_globals)  # noqa: S102
+            compiled_code = compile(code, f"<skill:{skill_id}>", "exec")
+            exec(compiled_code, sandbox_globals)  # noqa: S102
             # Check if the code defined a result
             result = sandbox_globals.get("result", "Skill executed successfully")
             logger.info(f"  Skill {skill_id} completed: {json.dumps(result, default=str)[:200]}")
-            return json.dumps({"success": True, "skill_id": skill_id, "result": result})
+            reported_failure = isinstance(result, dict) and result.get("success") is False
+            payload = {
+                "success": not reported_failure,
+                "skill_id": skill_id,
+                "result": result,
+            }
+            if reported_failure:
+                payload["error"] = result.get("error") or result.get("message") or "Skill reported failure"
+            return json.dumps(payload, default=str)
         except Exception as e:
+            traceback_text = traceback.format_exc()
             logger.error(f"Skill {skill_id} execution FAILED: {e}", exc_info=True)
-            return json.dumps({"success": False, "skill_id": skill_id, "error": str(e)})
+            return json.dumps({
+                "success": False,
+                "skill_id": skill_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "traceback": traceback_text[-6000:],
+            })
+
+    def _make_sandbox_tool_caller(self, tool_name: str):
+        """Build a sandbox tool wrapper accepting both natural calling styles.
+
+        Generated skills commonly call ``press_buttons(["A"], reasoning=...)``
+        while the MCP adapter expects keyword arguments. A single positional
+        mapping is also accepted for every tool.
+        """
+        def call(*call_args, **kwargs):
+            if len(call_args) > 1:
+                raise TypeError(f"{tool_name} accepts at most one positional argument")
+            if call_args:
+                positional = call_args[0]
+                if isinstance(positional, dict):
+                    overlap = set(positional).intersection(kwargs)
+                    if overlap:
+                        names = ", ".join(sorted(overlap))
+                        raise TypeError(f"{tool_name} received duplicate arguments: {names}")
+                    kwargs = {**positional, **kwargs}
+                elif tool_name == "press_buttons":
+                    if "buttons" in kwargs:
+                        raise TypeError("press_buttons received buttons both positionally and by keyword")
+                    kwargs = {"buttons": positional, **kwargs}
+                else:
+                    raise TypeError(
+                        f"{tool_name} positional argument must be a mapping; use keyword arguments"
+                    )
+
+            result = self.mcp_adapter.call_tool(tool_name, kwargs)
+            if tool_name == "press_buttons":
+                self._wait_for_actions_complete()
+            return result
+
+        return call
 
     def _execute_evolve_harness(self, arguments: dict) -> str:
         """Trigger an on-demand evolution pass."""
@@ -583,19 +615,11 @@ class PokeAgent:
         logger.info(f"Running code snippet ({len(code)} chars): {reasoning}")
 
         # Reuse the same sandbox builder as run_skill
-        def _tool_caller(tool_name):
-            def call(**kwargs):
-                result = self.mcp_adapter.call_tool(tool_name, kwargs)
-                if tool_name == "press_buttons":
-                    self._wait_for_actions_complete()
-                return result
-            return call
-
         # run_code is for debugging/prototyping ONLY - no game actions allowed
         # The agent must save code as a skill and use run_skill to execute actions
         sandbox_tools = {}
         for tool_name in ("get_game_state", "get_map_data"):
-            sandbox_tools[tool_name] = _tool_caller(tool_name)
+            sandbox_tools[tool_name] = self._make_sandbox_tool_caller(tool_name)
 
         import random, collections, math, json as _json_mod, re as _re_mod, heapq, itertools, functools
         import numpy as np
@@ -615,6 +639,9 @@ class PokeAgent:
                 "max": max, "sum": sum, "enumerate": enumerate, "zip": zip,
                 "sorted": sorted, "reversed": reversed, "isinstance": isinstance,
                 "map": map, "filter": filter, "any": any, "all": all,
+                "repr": repr,
+                "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
+                "KeyError": KeyError, "IndexError": IndexError,
                 "__import__": __import__,
                 "True": True, "False": False, "None": None,
             },
@@ -2989,7 +3016,8 @@ Step {step_count}"""
         recent_entries = self.conversation_history[-ACTION_HISTORY_WINDOW:]
 
         history_lines = []
-        for entry in recent_entries:
+        result_window_start = max(0, len(recent_entries) - 3)
+        for entry_index, entry in enumerate(recent_entries):
             step = entry.get("step", "?")
             llm_response = entry.get("llm_response", "").strip()
             start_coords = entry.get("start_coords")
@@ -3017,7 +3045,7 @@ Step {step_count}"""
                     result = tool_call.get("result", "")
                     history_lines.append(f"    - {name}")
                     history_lines.append(f"      args: {json.dumps(args, ensure_ascii=False)}")
-                    if result != "":
+                    if result != "" and entry_index >= result_window_start:
                         try:
                             history_lines.append(f"      result: {json.dumps(result, ensure_ascii=False)}")
                         except TypeError:

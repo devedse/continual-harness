@@ -167,7 +167,7 @@ Building code skills requires multiple steps. Do NOT try to write complex code i
 1. **Inspect**: Use `run_code` to call `tools['get_game_state']()` and `print()` the result. Understand the data structure before writing logic.
 2. **Prototype**: Write a small loop in `run_code` that does one thing (e.g., move toward a coordinate). Use `print()` to trace execution. Check the RESULTS FROM PREVIOUS STEP on the next turn to see output and errors.
 3. **Iterate**: If the code errors, read the traceback and fix it with another `run_code` call. Repeat until it works.
-4. **Save**: Once the code works, save it as a skill with `process_skill(action="add", entries=[{id: "descriptive_name", code: "..."}])`.
+4. **Save**: Once the code works, save it with every required field: `process_skill(action="add", entries=[{id: "descriptive_name", name: "Readable name", description: "What it does and when to use it", code: "..."}], reasoning="Saving tested reusable code")`.
 5. **Use**: Call `run_skill(skill_id="descriptive_name", args={...})` going forward.
 
 Skills that involve loops (navigation, combat sequences) should: read game state each iteration, detect stuck states, and exit after a max number of iterations.
@@ -192,6 +192,10 @@ You start with an **empty** subagent registry and skill library. Build them as y
 
 ## Constraints
 
+- **Be concise**: Produce one short `ANALYZE` and one short `PLAN`; do not restate either before the tool call. Put only the decisive evidence in tool `reasoning`.
+- **Bound action batches**: In dialogue, menus, near NPCs/warps/objects, or when the route is uncertain, use one deliberate input and observe again. Batch movement only across a verified straight walkable segment, stopping before the first interaction or transition tile.
+- **Skill mutations**: `process_skill(action="add")` must include non-empty `name` and `description`. Read the returned error once; never repeat an unchanged failed mutation. Use `update` after a skill has been created.
+- **Coordinate authority**: Treat structured player coordinates and `get_map_data()` as authoritative. The screenshot is for mode/visual evidence, not tile coordinates. Coerce coordinates and dimensions to integers before arithmetic; index maps as `grid[y][x]`.
 - **NEVER save the game** via the START menu.
 - **Unreachable warps**: If the game state marks a warp as "UNREACHABLE", avoid it.
 - **Button tokens only**: Only pass valid GBC button names to `press_buttons`. Use directional buttons to navigate menus, A to confirm, B to cancel.
