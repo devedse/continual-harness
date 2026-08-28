@@ -4532,14 +4532,24 @@ async def save_checkpoint(request_data: dict = None):
                 milestone_file = env.milestone_tracker.save_milestones_for_state(checkpoint_state)
                 logger.info(f"💾 Server: Saved checkpoint milestones")
 
+            agent_state = request_data.get("agent_state") if request_data else None
+            if isinstance(agent_state, dict):
+                from utils.data_persistence.resume import write_agent_state
+                write_agent_state(get_cache_path("agent_state.json"), agent_state)
+                logger.info(f"💾 Server: Saved agent-local checkpoint state at step {step_count}")
+
+            checkpoint_files = {
+                "state": checkpoint_state,
+                "milestones": str(get_cache_path("checkpoint_milestones.json")),
+                "map": str(get_cache_path("checkpoint_grids.json")),
+            }
+            if isinstance(agent_state, dict):
+                checkpoint_files["agent"] = str(get_cache_path("agent_state.json"))
+
             return {
                 "status": "checkpoint_saved",
                 "step_count": step_count,
-                "files": {
-                    "state": checkpoint_state,
-                    "milestones": str(get_cache_path("checkpoint_milestones.json")),
-                    "map": str(get_cache_path("checkpoint_grids.json"))
-                }
+                "files": checkpoint_files,
             }
         else:
             return {"status": "error", "message": "No emulator available"}

@@ -191,6 +191,7 @@ class PokeAgent:
         scaffold: str = "pokeagent",
         bootstrap_from: str = None,
         bootstrap_prompt_path: str = None,
+        resume_run: bool = False,
     ):
         logger.info(f"🚀 Initializing PokeAgent with backend={backend}, model={model}, server={server_url}, scaffold={scaffold}")
         self.server_url = server_url
@@ -209,6 +210,7 @@ class PokeAgent:
         self.bootstrap_active = bootstrap_from is not None
         self.bootstrap_from = bootstrap_from
         self.bootstrap_prompt_path = bootstrap_prompt_path
+        self.resume_run = resume_run
 
         # Conversation history for tracking and compaction
         self.conversation_history = []
@@ -225,6 +227,8 @@ class PokeAgent:
             publish_function_result=self._store_function_result_for_context,
             on_step_change=lambda step: setattr(self, "step_count", step),
         )
+        if self.resume_run:
+            self._restore_agent_state()
 
         # Determine which system instructions file to use
         if system_instructions_file is None:
@@ -323,6 +327,34 @@ class PokeAgent:
         content = render_prompt(content)
         logger.info(f"✅ Loaded system instructions from {filename} ({len(content)} chars)")
         return content
+
+    def _restore_agent_state(self) -> None:
+        """Restore agent-local context for a resumed run."""
+        try:
+            from utils.data_persistence.resume import load_agent_state
+            from utils.data_persistence.run_data_manager import get_cache_directory
+
+            state = load_agent_state(get_cache_directory(), history_limit=20)
+            self.conversation_history = list(state.get("conversation_history") or [])[-20:]
+            self.recent_function_results = [tuple(item) for item in state.get("recent_function_results") or []]
+            self.runtime.sync_step(int(state.get("step_count") or 0))
+            logger.info(
+                "🔄 Restored agent state from %s: step=%d, history=%d",
+                state.get("source", "unknown"),
+                self.step_count,
+                len(self.conversation_history),
+            )
+        except Exception as exc:
+            logger.warning("Could not restore agent-local state; continuing from emulator checkpoint: %s", exc)
+
+    def _serialize_agent_state(self) -> Dict[str, Any]:
+        """Return the short-term state that must match an emulator checkpoint."""
+        return {
+            "version": 1,
+            "step_count": self.step_count,
+            "conversation_history": self.conversation_history[-20:],
+            "recent_function_results": list(self.recent_function_results),
+        }
     
     def _load_base_prompt(self) -> str:
         """Load base prompt (strategic guidance) from file.
@@ -2996,9 +3028,15 @@ Step {step_count}"""
 
     def run(self) -> int:
         """Run the autonomous agent loop."""
-        # Clear conversation history
-        self.conversation_history = []
-        logger.info("🧹 Cleared conversation history (fresh start)")
+        if self.resume_run:
+            logger.info(
+                "🔄 Continuing resumed run at step %d with %d history entries",
+                self.step_count,
+                len(self.conversation_history),
+            )
+        else:
+            self.conversation_history = []
+            logger.info("🧹 Cleared conversation history (fresh start)")
 
         logger.info("=" * 70)
         _game_label = "Red" if os.environ.get("GAME_TYPE", "emerald").lower() == "red" else "Emerald"
@@ -3079,7 +3117,10 @@ Step {step_count}"""
                 try:
                     checkpoint_response = requests.post(
                         f"{self.server_url}/checkpoint",
-                        json={"step_count": self.step_count},
+                        json={
+                            "step_count": self.step_count,
+                            "agent_state": self._serialize_agent_state(),
+                        },
                         timeout=10
                     )
 

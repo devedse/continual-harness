@@ -4,7 +4,33 @@ set -e
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
-GAME="${1:-red}"
+GAME="red"
+RUN_ID="${RUN_ID:-1}"
+
+if [[ $# -gt 0 && "$1" != --* ]]; then
+    GAME="$1"
+    shift
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --run-id)
+            [[ $# -ge 2 ]] || { echo "--run-id requires a value" >&2; exit 2; }
+            RUN_ID="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            echo "Usage: ./setup_and_run.sh [red|emerald] [--run-id ID]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+RUN_ARGS=()
+if [[ -n "$RUN_ID" ]]; then
+    RUN_ARGS+=(--run-id "$RUN_ID")
+fi
 
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
@@ -73,6 +99,9 @@ export PYTHONUNBUFFERED=1
 echo "LLM endpoint: $OPENAI_BASE_URL"
 echo "Model: $MODEL_NAME"
 echo "Game: $GAME"
+if [[ -n "$RUN_ID" ]]; then
+    echo "Run ID: $RUN_ID (existing checkpoints resume automatically)"
+fi
 
 echo
 echo "[5/6] Choose agent mode..."
@@ -137,7 +166,8 @@ if [[ "$SCAFFOLD" == "continualharness" ]]; then
         --game "$GAME" \
         --direct-objectives categorized_full_game \
         --direct-objectives-start 0 \
-        --direct-objectives-battling-start 0
+        --direct-objectives-battling-start 0 \
+        "${RUN_ARGS[@]}"
 
 else
 
@@ -150,6 +180,7 @@ else
         --game "$GAME" \
         --direct-objectives categorized_full_game \
         --direct-objectives-start 0 \
-        --direct-objectives-battling-start 0
+        --direct-objectives-battling-start 0 \
+        "${RUN_ARGS[@]}"
 
 fi

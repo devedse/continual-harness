@@ -115,7 +115,7 @@ For module-level detail, see the README in each area:
 - **External CLI Harnesses**: Claude Code, Gemini CLI, Codex, and Hermes via `run_cli.py`
 - **Custom Agent Harnesses**: Multiple scaffold settings (e.g., `continualharness`, `pokeagent`, `simple`, `simplest`)
 - **PokeAgent local subagents**: Custom subagent abstractions accessible to our custom PokeAgent harness: `subagent_reflect`, `subagent_verify`, `subagent_gym_puzzle`, `subagent_summarize`, `subagent_battler`, and `subagent_plan_objectives`.
-- **Checkpoints & backups**: Save/resume runs; backups in `backups/`; analysis data in `run_data/`. Backups restore **disk** state under `.pokeagent_cache/` (objectives, long-term memory, checkpoint, trajectories file if present, etc.), not the agent’s in-memory short-term conversation window—see [utils/README.md](utils/README.md) (`data_persistence`).
+- **Checkpoints & backups**: Give `run.py` or `setup_and_run.sh` a stable `--run-id`; restarting with the same ID resumes the latest completed emulator step, objectives, learned stores, metrics, evolved prompt, and agent short-term state. Legacy checkpoints without `agent_state.json` reconstruct the rolling window from trajectories. Backups remain available under `backups/`; see [utils/README.md](utils/README.md) (`data_persistence`).
 - **Metrics & logging**: Per-step and cumulative tokens, cost, actions, and run initialization settings are stored in `.pokeagent_cache/{run_id}/cumulative_metrics.json`; LLM logs (`llm_logs/`) and backend session logs are also tracked, though `cumulative_metrics.json` is the aggregate source of truth.
 - **Map system**: **Emerald** — Porymap integration, NPC display, movement preview, portal tracking. **Red** — `RedMapReader` / PyBoy-backed map formatting (no Porymap).
 - **Web interface**: Real-time stream at `http://localhost:8000/stream` by default. The port can be manually specified via `--port` on both `run.py` and `run_cli.py`.
@@ -298,9 +298,17 @@ python run.py --game emerald --backend gemini --model-name gemini-2.5-flash --po
 # Red from the beginning
 python run.py --game red --backend gemini --model-name gemini-2.5-flash --port 8000 --agent-auto --scaffold pokeagent --direct-objectives categorized_full_game --direct-objectives-start 0 --direct-objectives-battling-start 0
 
-# Load a game-specific state or resume from that game's checkpoint
+# Load a game-specific state
 python run.py --game emerald --backend gemini --model-name gemini-2.5-flash --load-state Emerald-GBAdvance/splits/01_tutorial/01_tutorial.state --port 8000 --agent-auto --scaffold pokeagent --direct-objectives categorized_full_game --direct-objectives-start 0 --direct-objectives-battling-start 0
-python run.py --game red --backend gemini --model-name gemini-2.5-flash --load-checkpoint --port 8000 --agent-auto --scaffold pokeagent --direct-objectives categorized_full_game --direct-objectives-start 0 --direct-objectives-battling-start 0
+
+# Start a named run; use the same command later to resume its latest completed step
+python run.py --game red --run-id my-red-run --backend gemini --model-name gemini-2.5-flash --port 8000 --agent-auto --scaffold pokeagent --direct-objectives categorized_full_game --direct-objectives-start 0 --direct-objectives-battling-start 0
+
+# The WSL launcher defaults to run ID 1; later launches resume it automatically
+./setup_and_run.sh red
+
+# Override the default when running another independent game
+./setup_and_run.sh red --run-id my-other-run
 ```
 
 **run_cli.py** (external CLI agents via MCP): Starts the game server, frame server, and MCP proxy; the CLI agent in the container talks to the game through `get_game_state` and `press_buttons`. Use the [CLI Agent Backend Setup](#cli-agent-backend-setup-run_clipy) template; set the required env/auth for your backend and add `--build` on first run.
@@ -349,6 +357,7 @@ python run.py --scaffold pokeagent --agent-auto
 | `--port INT`                             | Port for the game server and web interface (default: 8000). In agent mode, the frame stream server uses `port + 1`; `run.py` does not start a separate MCP proxy.                                                                                        |
 | `--load-state PATH`                      | Load a saved state file on startup.                                                                                                                                                                                                                      |
 | `--load-checkpoint`                      | Load from checkpoint files in the run cache.                                                                                                                                                                                                             |
+| `--run-id ID`                            | Use a stable run identity. If `.pokeagent_cache/{ID}/checkpoint.state` exists, automatically resume that emulator and agent checkpoint; otherwise start a new run with this ID.                                                                         |
 | `--backup-state PATH`                    | Load from a backup zip; extracts to cache and loads checkpoint, metrics, and persistent knowledge (preferred for resuming a run).                                                                                                                        |
 | `--bootstrap-from PATH`                  | Import learned artifacts from a prior run (`memory.json`, `skills.json`, `subagents.json`, and an evolved orchestrator policy when present).                                                                                                             |
 | `--backend NAME`                         | VLM backend: `openai`, `gemini`, `openrouter`, `anthropic`, `vertex`, or `auto` (default: `gemini`).                                                                                                                                                     |

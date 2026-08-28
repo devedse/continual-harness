@@ -278,6 +278,9 @@ def start_custom_agent(agent_config, args):
     # Pass scaffold name to PokeAgent so it can select tool set and prompt
     if agent_config.get("class") == "PokeAgent":
         agent_kwargs["scaffold"] = args.scaffold
+        agent_kwargs["resume_run"] = getattr(args, "resume_run", False)
+        if getattr(args, "resume_prompt_path", None):
+            agent_kwargs["bootstrap_prompt_path"] = args.resume_prompt_path
         if getattr(args, "bootstrap_from", None):
             agent_kwargs["bootstrap_from"] = args.bootstrap_from
             agent_kwargs["bootstrap_prompt_path"] = getattr(args, "bootstrap_prompt_path", None)
@@ -347,6 +350,8 @@ def main():
                        help="Deprecated alias for --clear-memory")
     parser.add_argument("--run-name", type=str, default=None,
                        help="Optional name to append to run directory (e.g., 'test_run' -> 'run_20251129_191503_test_run')")
+    parser.add_argument("--run-id", type=str, default=None,
+                       help="Stable run identifier. If its cache contains checkpoint.state, resume that run automatically.")
     parser.add_argument("--enable-prompt-optimization", action="store_true",
                        help="Enable reflective prompt optimization based on trajectory analysis")
     parser.add_argument("--optimization-window-length", type=int, default=50,
@@ -390,16 +395,43 @@ def main():
             print(f"⚠️  Could not retrieve first objective from '{args.direct_objectives}' (index {args.direct_objectives_start})")
             print(f"    Using timestamp-based run_id format instead")
     
-    # Initialize run data manager for this run (client creates the run_id)
+    # Initialize run data manager for this run (client creates or reuses the run_id)
     from utils.data_persistence.run_data_manager import initialize_run_data_manager
+    from utils.data_persistence.resume import (
+        cache_directory_for_run,
+        find_latest_evolved_prompt,
+        validate_run_id,
+    )
+
+    if args.run_id:
+        try:
+            args.run_id = validate_run_id(args.run_id)
+        except ValueError as exc:
+            parser.error(str(exc))
     
     run_manager = initialize_run_data_manager(
+        run_id=args.run_id,
         run_name=args.run_name,
         first_objective_id=first_objective_id,
         first_objective_desc=first_objective_desc
     )
     run_id = run_manager.run_id
     print(f"📁 Run data directory: {run_manager.get_run_directory()}")
+
+    args.resume_run = False
+    args.resume_prompt_path = None
+    if args.run_id and not args.backup_state and not args.load_state:
+        checkpoint_state = cache_directory_for_run(run_id) / "checkpoint.state"
+        if checkpoint_state.exists():
+            args.load_checkpoint = True
+            args.resume_run = True
+            evolved_prompt = find_latest_evolved_prompt(run_id)
+            args.resume_prompt_path = str(evolved_prompt) if evolved_prompt else None
+            print(f"🔄 Resuming run '{run_id}' from {checkpoint_state}")
+            if evolved_prompt:
+                print(f"🧬 Restoring evolved prompt: {evolved_prompt}")
+        else:
+            print(f"🆕 Starting new stable run '{run_id}'")
     
     # Generate LLM session_id for consistent logging across processes
     from datetime import datetime
@@ -413,13 +445,17 @@ def main():
         os.environ["RUN_NAME"] = args.run_name
     
     # Save metadata with command line information
+    run_metadata = {
+        "entry_point": "run.py",
+        "mode": "multiprocess_client",
+    }
+    if args.resume_run:
+        run_metadata["resumed_from_checkpoint_at"] = datetime.now().isoformat()
+
     run_manager.save_metadata(
         command_args=vars(args),
         sys_argv=sys.argv,
-        additional_info={
-            "entry_point": "run.py",
-            "mode": "multiprocess_client"
-        }
+        additional_info=run_metadata,
     )
     
     server_process = None
