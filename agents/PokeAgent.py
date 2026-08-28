@@ -1752,7 +1752,7 @@ class PokeAgent:
                         return self.vlm.get_query(image, prompt, orchestrator_interaction_name)
 
                     logger.info(f"📡 Calling VLM API with image (prompt: {len(prompt)} chars, image: {len(screenshot_b64)} bytes)")
-                    logger.info(f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - timeout set to 600s...")
+                    logger.info(f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - timeout set to 6000s...")
 
                     max_retries = 3
                     retry_count = 0
@@ -1768,7 +1768,7 @@ class PokeAgent:
                             # for pro-preview thinking models). Anything smaller would
                             # silently truncate slow calls and leak ghost worker threads
                             # whose responses get logged but never used by the agent.
-                            response = future.result(timeout=600)
+                            response = future.result(timeout=6000)
                             vlm_duration = time.time() - vlm_call_start
                             logger.info(f"   ✅ VLM call completed in {vlm_duration:.1f}s (attempt {retry_count + 1}/{max_retries})")
                             break
@@ -1792,7 +1792,7 @@ class PokeAgent:
                         return self.vlm.get_text_query(prompt, orchestrator_interaction_name)
 
                     logger.info(f"📡 Calling VLM API with text only (prompt: {len(prompt)} chars)")
-                    logger.info(f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - timeout set to 600s...")
+                    logger.info(f"   ⏱️  Started at {time.strftime('%H:%M:%S')} - timeout set to 6000s...")
 
                     max_retries = 3
                     retry_count = 0
@@ -1808,7 +1808,7 @@ class PokeAgent:
                             # for pro-preview thinking models). Anything smaller would
                             # silently truncate slow calls and leak ghost worker threads
                             # whose responses get logged but never used by the agent.
-                            response = future.result(timeout=600)
+                            response = future.result(timeout=6000)
                             vlm_duration = time.time() - vlm_call_start
                             logger.info(f"   ✅ VLM call completed in {vlm_duration:.1f}s (attempt {retry_count + 1}/{max_retries})")
                             break
