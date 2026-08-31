@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+# Windows-native scripts retain their conventional line endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Never apply line-ending conversion to binary run artifacts.
+*.gb binary
+*.gba binary
+*.png binary
+*.state binary
+*.zip binary
+*.mp4 binary
