@@ -63,6 +63,26 @@
             background: #33ff33;
             box-shadow: 0 0 8px #33ff33;
         }
+
+        .header-nav-link {
+            border: 1px solid #33ff33;
+            background: #0a0a0a;
+            color: #33ff33;
+            font-size: 14px;
+            letter-spacing: 1px;
+            padding: 4px 10px;
+            margin-right: 10px;
+            text-decoration: none;
+            white-space: nowrap;
+        }
+
+        .header-nav-link:hover,
+        .header-nav-link:focus-visible {
+            color: #0a0a0a;
+            background: #33ff33;
+            box-shadow: 0 0 8px #33ff33;
+            outline: none;
+        }
         
         .content {
             display: flex;
@@ -708,6 +728,7 @@
         <div class="header-logo">PokeAgent Challenge //</div>
         <div class="header-title">PROTOCOL_EMERALD // AGENT = PLAYER</div>
         <div style="flex: 1;"></div>
+        <a class="header-nav-link" href="/timeline">▦ TIMELINE</a>
         <button id="audio-toggle" class="audio-toggle" type="button" aria-pressed="false">🔇 AUDIO OFF</button>
         <div id="metrics-display" style="color: #33ff33; margin-right: 20px; font-size: 14px;">
             <span id="cost-metric">Cost: $0.00</span> |

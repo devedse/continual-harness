@@ -9,6 +9,8 @@ in the later analysis of data, debugging, and prompt optimization.
 import os
 import sys
 import json
+import base64
+import binascii
 import shutil
 import subprocess
 from datetime import datetime
@@ -70,10 +72,11 @@ class RunDataManager:
         logger.info(f"RunDataManager initialized: {self.run_dir}")
     
     def _create_directory_structure(self):
-        """Create the standardized directory structure with 3 components:
+        """Create the standardized directory structure with 4 components:
         1. prompt_evolution/ - Data for prompt optimization (llm_traces, trajectories)
         2. end_state/ - End-state information (metadata, map_data, frame_cache, videos, logs, game_state)
         3. agent_scratch_space/ - Files written/generated/read by LLM tool calls
+        4. screenshots/ - The frame captured at the start of each agent step
         """
         self.run_dir.mkdir(exist_ok=True)
         
@@ -86,6 +89,9 @@ class RunDataManager:
         (self.run_dir / "end_state" / "frame_cache").mkdir(parents=True, exist_ok=True)
         (self.run_dir / "end_state" / "videos").mkdir(parents=True, exist_ok=True)
         (self.run_dir / "end_state" / "logs").mkdir(parents=True, exist_ok=True)
+
+        # Per-step visual record, captured from the same frame sent to the model.
+        (self.run_dir / "screenshots").mkdir(exist_ok=True)
         
         # Component 3: Agent scratch space (for files written by LLM tool calls)
         (self.run_dir / "agent_scratch_space").mkdir(exist_ok=True)
@@ -103,6 +109,40 @@ class RunDataManager:
     def get_scratch_space_dir(self) -> Path:
         """Get the agent scratch space directory"""
         return self.run_dir / "agent_scratch_space"
+
+    def save_step_screenshot(self, step: int, screenshot_base64: str) -> Optional[Path]:
+        """Save the screenshot captured at the start of a logical agent step.
+
+        Repeating a failed step deliberately replaces the same file, keeping one
+        frame per logical step. Errors are non-fatal so artifact persistence can
+        never interrupt the agent loop.
+        """
+        if not screenshot_base64:
+            logger.warning("No screenshot available to save for step %s", step)
+            return None
+        if not isinstance(screenshot_base64, str):
+            logger.warning("Screenshot for step %s is not base64 text", step)
+            return None
+
+        try:
+            payload = screenshot_base64
+            if payload.startswith("data:"):
+                _, payload = payload.split(",", 1)
+            image_data = base64.b64decode(payload, validate=True)
+            if not image_data:
+                raise ValueError("decoded screenshot is empty")
+
+            screenshots_dir = self.run_dir / "screenshots"
+            screenshots_dir.mkdir(parents=True, exist_ok=True)
+            screenshot_path = screenshots_dir / f"step_{int(step):06d}.png"
+            temporary_path = screenshot_path.with_suffix(".png.tmp")
+            temporary_path.write_bytes(image_data)
+            os.replace(temporary_path, screenshot_path)
+            logger.info("📸 Saved step screenshot: %s", screenshot_path)
+            return screenshot_path
+        except (binascii.Error, ValueError, OSError, TypeError) as exc:
+            logger.warning("Failed to save screenshot for step %s: %s", step, exc)
+            return None
     
     def save_metadata(self, 
                      command_args: Dict[str, Any],

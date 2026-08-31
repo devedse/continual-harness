@@ -1612,6 +1612,10 @@ Step {step_count}"""
                     time.sleep(5)
                     continue
 
+                run_manager = get_run_data_manager()
+                if run_manager is not None:
+                    run_manager.save_step_screenshot(self.step_count + 1, screenshot_b64)
+
                 # Build prompt
                 prompt = self._build_structured_prompt(game_state_result, self.step_count)
 

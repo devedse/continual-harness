@@ -27,9 +27,9 @@ import numpy as np
 import requests
 import uvicorn
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from PIL import Image
 from pydantic import BaseModel, Field
 from urllib.parse import quote_plus
@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.anticheat import AntiCheatTracker
 from utils.json_utils import normalize_replan_edits
 from utils.llm_provider_ui import infer_llm_provider_family
+from server.timeline import discover_timeline_frames, resolve_timeline_frame, select_timeline_delta
 
 # Set up logging - reduced verbosity for multiprocess mode
 logging.basicConfig(level=logging.WARNING)
@@ -1050,6 +1051,78 @@ async def get_stream():
         return HTMLResponse(content=content)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Stream interface not found")
+
+
+@app.get("/timeline")
+async def get_timeline():
+    """Serve the active run's screenshot timeline viewer."""
+    try:
+        with open("server/timeline.html", "r", encoding="utf-8") as timeline_file:
+            return HTMLResponse(content=timeline_file.read())
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Timeline interface not found")
+
+
+@app.get("/api/timeline")
+async def get_timeline_index(
+    after_step: Optional[int] = Query(default=None, ge=0),
+    known_last_version: Optional[int] = Query(default=None, ge=0),
+    known_count: Optional[int] = Query(default=None, ge=0),
+    client_run_id: Optional[str] = None,
+):
+    """List all screenshots initially, then return compact polling deltas."""
+    from utils.data_persistence.run_data_manager import get_run_data_manager
+
+    run_manager = get_run_data_manager()
+    if run_manager is None:
+        return {
+            "run_id": None,
+            "frames": [],
+            "count": 0,
+            "first_step": None,
+            "last_step": None,
+            "incremental": False,
+            "reset": True,
+        }
+
+    frames = discover_timeline_frames(run_manager.run_dir)
+    last_step = frames[-1]["step"] if frames else None
+    can_increment = (
+        after_step is not None
+        and client_run_id == run_manager.run_id
+        and (last_step is None or after_step <= last_step)
+        and (known_count is None or known_count <= len(frames))
+    )
+    response_frames = (
+        select_timeline_delta(frames, after_step, known_last_version)
+        if can_increment
+        else frames
+    )
+    return {
+        "run_id": run_manager.run_id,
+        "frames": response_frames,
+        "count": len(frames),
+        "first_step": frames[0]["step"] if frames else None,
+        "last_step": last_step,
+        "incremental": can_increment,
+        "reset": not can_increment,
+    }
+
+
+@app.get("/api/timeline/frames/{step}")
+async def get_timeline_frame(step: int):
+    """Return one saved frame from the active run."""
+    from utils.data_persistence.run_data_manager import get_run_data_manager
+
+    run_manager = get_run_data_manager()
+    frame_path = resolve_timeline_frame(run_manager.run_dir, step) if run_manager else None
+    if frame_path is None:
+        raise HTTPException(status_code=404, detail=f"No timeline frame for step {step}")
+    return FileResponse(
+        frame_path,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 # FastAPI endpoints
@@ -5000,6 +5073,7 @@ def main():
     print(f"   Local: http://localhost:{args.port}")
     print(f"   Network: http://{local_ip}:{args.port}")
     print(f"📺 Stream interface: http://{local_ip}:{args.port}/stream")
+    print(f"🎞️  Timeline viewer: http://{local_ip}:{args.port}/timeline")
 
     # Initialize video recording AFTER FastAPI server starts
     if args.record:
