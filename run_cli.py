@@ -27,6 +27,16 @@ from dataclasses import dataclass
 from pathlib import Path
 import requests
 
+from utils.server_startup import (
+    ServerPortUnavailable,
+    assert_server_port_available,
+    new_server_startup_token,
+    server_port_has_listener,
+    stop_failed_server,
+    wait_for_server_port_available,
+    wait_for_server_startup,
+)
+
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -303,11 +313,33 @@ def start_server(args, run_id=None):
     Returns:
         subprocess.Popen: Server process, or None if failed
     """
+    try:
+        assert_server_port_available(args.host, args.port)
+    except ServerPortUnavailable as exc:
+        if server_port_has_listener(args.port):
+            print(f"❌ {exc}")
+            return None
+        print(
+            f"⏳ Port {args.port} has no listener but is still reserved by stale "
+            "network state; waiting up to 300 seconds for release..."
+        )
+        available, reason = wait_for_server_port_available(args.host, args.port)
+        if not available:
+            print(f"❌ Port {args.port} was not released: {reason}")
+            return None
+        print(f"✅ Port {args.port} has been released")
+
     python_exe = sys.executable
-    server_cmd = [python_exe, "-m", "server.app", "--port", str(args.port)]
+    server_cmd = [
+        python_exe, "-m", "server.app",
+        "--host", args.host,
+        "--port", str(args.port),
+    ]
     
     # Set up environment for server
     server_env = os.environ.copy()
+    startup_token = new_server_startup_token()
+    server_env["POKEAGENT_SERVER_STARTUP_TOKEN"] = startup_token
     if run_id:
         server_env["RUN_DATA_ID"] = run_id
     server_env["POKEAGENT_CLI_MODE"] = "1"  # Enable CLI-specific behavior (milestone backups, skip objectives)
@@ -362,30 +394,23 @@ def start_server(args, run_id=None):
             universal_newlines=True,
             bufsize=1
         )
-        print(f"✅ Server started with PID {server_process.pid}")
-        print("⏳ Waiting 5 seconds for server to initialize...")
-        time.sleep(5)
-        
+        print(f"✅ Server process started with PID {server_process.pid}")
+        print("⏳ Waiting for this server's health handshake (up to 120 seconds)...")
+        ready, reason = wait_for_server_startup(
+            server_process,
+            args.port,
+            startup_token,
+        )
+        if not ready:
+            print(f"❌ Game server failed to become ready: {reason}")
+            stop_failed_server(server_process)
+            return None
+
+        print("✅ Game server health handshake succeeded")
         return server_process
         
     except Exception as e:
         print(f"❌ Failed to start server: {e}")
-        return None
-
-
-def start_frame_server(port):
-    """Start the lightweight frame server for stream.html visualization."""
-    try:
-        frame_cmd = ["python", "-m", "server.frame_server", "--port", str(port + 1)]
-        frame_process = subprocess.Popen(
-            frame_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        print(f"🖼️  Frame server started with PID {frame_process.pid}")
-        return frame_process
-    except Exception as e:
-        print(f"⚠️ Could not start frame server: {e}")
         return None
 
 
@@ -501,9 +526,8 @@ def termination_monitor(
 
 @dataclass
 class Services:
-    """Running services (server, frame server, MCP) and URLs."""
+    """Running game and MCP services plus their URLs."""
     server: subprocess.Popen | None
-    frame_server: subprocess.Popen | None
     mcp_process: subprocess.Popen | None
     server_url: str
 
@@ -556,12 +580,11 @@ def _restore_from_backup(backup_path: str) -> bool:
 
 
 def _start_services(args, run_manager) -> Services | None:
-    """Start server, frame server, and optionally MCP SSE server. Returns Services or None if server failed."""
+    """Start the game and MCP SSE servers. Return their handles on success."""
     server_process = start_server(args, run_manager.run_id)
     if not server_process:
         return None
 
-    frame_server_process = start_frame_server(args.port)
     server_url = f"http://localhost:{args.port}"
 
     mcp_process = None
@@ -580,7 +603,6 @@ def _start_services(args, run_manager) -> Services | None:
 
     return Services(
         server=server_process,
-        frame_server=frame_server_process,
         mcp_process=mcp_process,
         server_url=server_url,
     )
@@ -593,7 +615,7 @@ def _cleanup_services(
     args,
     graceful_timeout: int = 30,
 ) -> None:
-    """Clean up server, frame server, MCP server, and CLI agent."""
+    """Clean up the game server, MCP server, and CLI agent."""
     if cli_session is not None and cli_session.process.poll() is None:
         _terminate_process(
             process=cli_session.process,
@@ -615,13 +637,6 @@ def _cleanup_services(
             except subprocess.TimeoutExpired:
                 print("   Force killing server...")
                 services.server.kill()
-        if services.frame_server:
-            print("🖼️  Stopping frame server...")
-            services.frame_server.terminate()
-            try:
-                services.frame_server.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                services.frame_server.kill()
         if services.mcp_process:
             print("🌐 Stopping MCP SSE server...")
             services.mcp_process.terminate()
@@ -911,6 +926,8 @@ def main():
                        default=CLI_AGENT_DIRECTIVE_PATH,
                        help="Path to system prompt/directive file for CLI agent")
     parser.add_argument("--port", type=int, default=8000, help="Port for the game server (default: 8000)")
+    parser.add_argument("--host", type=str, default=os.environ.get("WEB_HOST", "0.0.0.0"),
+                       help="Address for the web interface (default: all network interfaces)")
     parser.add_argument("--load-state", type=str, help="Load a saved state file on startup")
     parser.add_argument("--load-checkpoint", action="store_true", help="Load from checkpoint files")
     parser.add_argument("--backup-state", type=str,

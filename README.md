@@ -135,8 +135,9 @@ continual-harness/
 ├── server/
 │   ├── app.py                # FastAPI game server (emulator, /state, /action, /mcp/*, etc.)
 │   ├── agent_thinking.txt    # Runtime file (gitignored); server writes latest thinking for UI
-│   ├── frame_server.py       # Frame streaming
-│   ├── stream.html           # Web UI for streaming
+│   ├── stream.html           # Live WebSocket streaming UI
+│   ├── timeline.html         # Saved per-step screenshot viewer
+│   ├── timeline.py           # Timeline indexing helpers
 │   └── cli/
 │       └── pokemon_mcp_server.py   # MCP proxy: stdio ↔ HTTP to game server
 ├── agents/

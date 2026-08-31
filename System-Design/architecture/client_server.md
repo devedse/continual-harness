@@ -8,11 +8,10 @@ Headless **FastAPI** app: game loop + REST state/action endpoints + **`POST /mcp
 
 | Service | Entry | Port (typical) |
 |---------|--------|----------------|
-| Game server | `python -m server.app --port N` | `N` (e.g. 8000) |
-| Frame stream UI | `python -m server.frame_server --port N+1` | `N+1` |
+| Game server + live/timeline UIs | `python -m server.app --port N` | `N` (e.g. 8000) |
 | MCP proxy (CLI runs) | `server/cli/pokemon_mcp_server.py` | `MCP_PORT` or `run_cli --mcp-sse-port` (often `N+2`) |
 
-`run.py` and `run_cli.py` both spawn the **frame server** (`server/frame_server.py`) for `stream.html`. Only `run_cli.py` starts the separate MCP proxy; `run.py` agents call the game server's HTTP routes directly.
+The game server serves `stream.html` and pushes live frames through `/ws/frames`; no second frame-streaming process is required. Only `run_cli.py` starts the separate MCP proxy; `run.py` agents call the game server's HTTP routes directly.
 
 ## ROM selection (current behavior)
 

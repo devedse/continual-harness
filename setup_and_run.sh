@@ -35,7 +35,7 @@ fi
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
 echo
-echo "[1/6] Checking uv..."
+echo "[1/7] Checking uv..."
 
 if ! command -v uv >/dev/null 2>&1; then
     echo "uv not found. Installing..."
@@ -46,7 +46,7 @@ else
 fi
 
 echo
-echo "[2/6] Checking mGBA..."
+echo "[2/7] Checking mGBA..."
 
 if ! ldconfig -p 2>/dev/null | grep -q libmgba; then
     echo "mGBA not found. Installing mGBA 0.10.5 for Ubuntu 24.04..."
@@ -80,16 +80,18 @@ else
 fi
 
 echo
-echo "[3/6] Installing Python dependencies..."
+echo "[3/7] Installing Python dependencies..."
 
 uv sync
 
 echo "Python dependencies ready."
 
 echo
-echo "[4/6] Configuring local llama.cpp server..."
+echo "[4/7] Configuring local llama.cpp server..."
 
-export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://10.88.10.1:8080/v1}"
+#export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://10.88.10.1:8080/v1}"
+export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://10.88.28.215:8081/v1}"
+
 
 MODEL_NAME="${MODEL_NAME:-Qwen3.8-flash-next}"
 
@@ -104,7 +106,29 @@ if [[ -n "$RUN_ID" ]]; then
 fi
 
 echo
-echo "[5/6] Choose agent mode..."
+echo "[5/7] Configuring web access..."
+
+export WEB_HOST="${WEB_HOST:-0.0.0.0}"
+WEB_PORT="${WEB_PORT:-8000}"
+
+if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null && command -v powershell.exe >/dev/null 2>&1; then
+    WSL_ADDRESS="$(hostname -I | awk '{print $1}')"
+    LAN_SCRIPT="$(wslpath -w "$REPO_DIR/scripts/configure_wsl_lan.ps1")"
+    if ! powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$LAN_SCRIPT" -Port "$WEB_PORT" -WslAddress "$WSL_ADDRESS"; then
+        echo "WARNING: LAN forwarding could not be configured. Local access will still work."
+        echo "Run scripts/configure_wsl_lan.ps1 from an elevated Windows PowerShell to retry."
+    fi
+else
+    LAN_ADDRESS="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "Web server will listen on all interfaces (${WEB_HOST}:${WEB_PORT})."
+    if [[ -n "$LAN_ADDRESS" ]]; then
+        echo "  Live:     http://${LAN_ADDRESS}:${WEB_PORT}/stream"
+        echo "  Timeline: http://${LAN_ADDRESS}:${WEB_PORT}/timeline"
+    fi
+fi
+
+echo
+echo "[6/7] Choose agent mode..."
 echo
 echo "  1) PokeAgent"
 echo "     Expert/prebuilt scaffold."
@@ -140,13 +164,14 @@ while true; do
 done
 
 echo
-echo "[6/6] Starting $MODE_NAME..."
+echo "[7/7] Starting $MODE_NAME..."
 echo
 echo "Game:     $GAME"
 echo "Model:    $MODEL_NAME"
 echo "Mode:     $MODE_NAME"
 echo "Scaffold: $SCAFFOLD"
-echo "Web UI:   http://localhost:8000/stream"
+echo "Live UI:  http://localhost:${WEB_PORT}/stream"
+echo "Timeline: http://localhost:${WEB_PORT}/timeline"
 echo
 
 if [[ "$SCAFFOLD" == "continualharness" ]]; then
@@ -158,7 +183,8 @@ if [[ "$SCAFFOLD" == "continualharness" ]]; then
     exec uv run python run.py \
         --backend openai \
         --model-name "$MODEL_NAME" \
-        --port 8000 \
+        --host "$WEB_HOST" \
+        --port "$WEB_PORT" \
         --agent-auto \
         --scaffold continualharness \
         --enable-prompt-optimization \
@@ -174,7 +200,8 @@ else
     exec uv run python run.py \
         --backend openai \
         --model-name "$MODEL_NAME" \
-        --port 8000 \
+        --host "$WEB_HOST" \
+        --port "$WEB_PORT" \
         --agent-auto \
         --scaffold pokeagent \
         --game "$GAME" \

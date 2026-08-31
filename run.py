@@ -11,6 +11,16 @@ import argparse
 import subprocess
 import signal
 
+from utils.server_startup import (
+    ServerPortUnavailable,
+    assert_server_port_available,
+    new_server_startup_token,
+    server_port_has_listener,
+    stop_failed_server,
+    wait_for_server_port_available,
+    wait_for_server_startup,
+)
+
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 CUSTOM_AGENT_CONFIGS = {
@@ -110,12 +120,34 @@ def start_server(args, run_id=None):
         args: Command line arguments
         run_id: Optional run_id to pass to server via environment variable
     """
+    try:
+        assert_server_port_available(args.host, args.port)
+    except ServerPortUnavailable as exc:
+        if server_port_has_listener(args.port):
+            print(f"❌ {exc}")
+            return None
+        print(
+            f"⏳ Port {args.port} has no listener but is still reserved by stale "
+            "network state; waiting up to 300 seconds for release..."
+        )
+        available, reason = wait_for_server_port_available(args.host, args.port)
+        if not available:
+            print(f"❌ Port {args.port} was not released: {reason}")
+            return None
+        print(f"✅ Port {args.port} has been released")
+
     # Use the same Python executable that's running this script
     python_exe = sys.executable
-    server_cmd = [python_exe, "-m", "server.app", "--port", str(args.port)]
+    server_cmd = [
+        python_exe, "-m", "server.app",
+        "--host", args.host,
+        "--port", str(args.port),
+    ]
     
     # Pass run_id and llm_session_id to server via environment variable if provided
     server_env = os.environ.copy()
+    startup_token = new_server_startup_token()
+    server_env["POKEAGENT_SERVER_STARTUP_TOKEN"] = startup_token
     if run_id:
         server_env["RUN_DATA_ID"] = run_id
     
@@ -182,30 +214,23 @@ def start_server(args, run_id=None):
             universal_newlines=True,
             bufsize=1
         )
-        print(f"✅ Server started with PID {server_process.pid}")
-        print("⏳ Waiting 3 seconds for server to initialize...")
-        time.sleep(3)
-        
+        print(f"✅ Server process started with PID {server_process.pid}")
+        print("⏳ Waiting for this server's health handshake (up to 120 seconds)...")
+        ready, reason = wait_for_server_startup(
+            server_process,
+            args.port,
+            startup_token,
+        )
+        if not ready:
+            print(f"❌ Game server failed to become ready: {reason}")
+            stop_failed_server(server_process)
+            return None
+
+        print("✅ Game server health handshake succeeded")
         return server_process
         
     except Exception as e:
         print(f"❌ Failed to start server: {e}")
-        return None
-
-
-def start_frame_server(port):
-    """Start the lightweight frame server for stream.html visualization"""
-    try:
-        frame_cmd = ["python", "-m", "server.frame_server", "--port", str(port+1)]
-        frame_process = subprocess.Popen(
-            frame_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        print(f"🖼️  Frame server started with PID {frame_process.pid}")
-        return frame_process
-    except Exception as e:
-        print(f"⚠️ Could not start frame server: {e}")
         return None
 
 
@@ -302,6 +327,8 @@ def main():
                        help="Path to ROM file")
     parser.add_argument("--port", type=int, default=8000,
                        help="Port for web interface")
+    parser.add_argument("--host", type=str, default=os.environ.get("WEB_HOST", "0.0.0.0"),
+                       help="Address for the web interface (default: all network interfaces)")
     
     # State loading
     parser.add_argument("--load-state", type=str, 
@@ -459,8 +486,6 @@ def main():
     )
     
     server_process = None
-    frame_server_process = None
-    
     try:
         # Restore from backup if requested
         if args.backup_state:
@@ -529,8 +554,6 @@ def main():
             # Single-writer metrics: client should not write to cache
             os.environ["LLM_METRICS_WRITE_ENABLED"] = "false"
             
-            # Also start frame server for web visualization
-            frame_server_process = start_frame_server(args.port)
         else:
             print("\n📋 Manual server mode - start server separately with:")
             print("   python -m server.app --port", args.port)
@@ -549,7 +572,8 @@ def main():
         if args.record:
             print("   Recording: Enabled")
         
-        print(f"🎥 Stream View: http://127.0.0.1:{args.port}/stream")
+        print(f"🎥 Live View: http://localhost:{args.port}/stream")
+        print(f"🎞️  Timeline: http://localhost:{args.port}/timeline")
 
         # All supported scaffolds are custom benchmark agents
         if args.scaffold in CUSTOM_AGENT_CONFIGS:
@@ -573,14 +597,6 @@ def main():
             except subprocess.TimeoutExpired:
                 print("   Force killing server...")
                 server_process.kill()
-        
-        if frame_server_process:
-            print("🖼️  Stopping frame server...")
-            frame_server_process.terminate()
-            try:
-                frame_server_process.wait(timeout=2)
-            except:
-                frame_server_process.kill()
         
         print("👋 Goodbye!")
 

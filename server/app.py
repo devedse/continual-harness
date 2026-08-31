@@ -1028,11 +1028,11 @@ def game_loop(manual_mode=False):
         time.sleep(1.0 / current_fps)
 
 
-def run_fastapi_server(port):
+def run_fastapi_server(port, host="0.0.0.0"):
     """Run FastAPI server in background thread"""
     uvicorn.run(
         app,
-        host="0.0.0.0",
+        host=host,
         port=port,
         log_level="error",
         access_log=False,
@@ -1139,7 +1139,11 @@ async def get_config():
 @app.get("/health")
 async def get_health():
     """Health check endpoint for server monitoring"""
-    return {"status": "healthy", "timestamp": time.time()}
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "startup_token": os.environ.get("POKEAGENT_SERVER_STARTUP_TOKEN"),
+    }
 
 
 @app.get("/status")
@@ -4847,6 +4851,8 @@ def main():
     parser.add_argument("--game", type=str, default="emerald", choices=["red", "emerald"],
                        help="Which game to run: 'red' (Pokemon Red, Game Boy) or 'emerald' (Pokemon Emerald, GBA)")
     parser.add_argument("--port", type=int, default=8000, help="Port for FastAPI server")
+    parser.add_argument("--host", type=str, default="0.0.0.0",
+                       help="Address for the web interface (default: all network interfaces)")
     parser.add_argument("--manual", action="store_true", help="Enable manual mode with keyboard input and overlay")
     parser.add_argument("--load-state", type=str, help="Load a saved state file on startup")
     parser.add_argument("--record", action="store_true", help="Record video of the gameplay")
@@ -5058,7 +5064,7 @@ def main():
     state_update_thread.start()
 
     # Start FastAPI server in background thread
-    server_thread = threading.Thread(target=run_fastapi_server, args=(args.port,), daemon=True)
+    server_thread = threading.Thread(target=run_fastapi_server, args=(args.port, args.host), daemon=True)
     server_thread.start()
 
     # Get local IP for network access
@@ -5070,6 +5076,7 @@ def main():
         local_ip = "127.0.0.1"
 
     print(f"🌐 FastAPI server running:")
+    print(f"   Bound: {args.host}:{args.port}")
     print(f"   Local: http://localhost:{args.port}")
     print(f"   Network: http://{local_ip}:{args.port}")
     print(f"📺 Stream interface: http://{local_ip}:{args.port}/stream")
