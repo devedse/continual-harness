@@ -25,6 +25,11 @@ def _filename_arg(load_mock):
     return args[1] if len(args) > 1 else args[0]
 
 
+def _assert_sections_in_order(prompt, *sections):
+    positions = [prompt.index(section) for section in sections]
+    assert positions == sorted(positions), dict(zip(sections, positions))
+
+
 def test_auto_system_uses_pokeagent_without_optimization():
     load_mock = MagicMock(return_value="SYS_BODY")
     with patch.object(_POKE_MODULE, "MCPToolAdapter"), patch.object(_POKE_MODULE, "VLM"), patch.object(
@@ -225,6 +230,17 @@ def test_simplest_prompt_excludes_stores_and_objectives():
     assert "### LONG-TERM MEMORY OVERVIEW" in prompt
     assert "### STATE" in prompt
     assert "### SHORT-TERM MEMORY" in prompt
+    _assert_sections_in_order(
+        prompt,
+        "### LONG-TERM MEMORY OVERVIEW",
+        "### STATE — SLOW-CHANGING CONTEXT",
+        "### SHORT-TERM MEMORY",
+        "### HISTORY CHRONOLOGY INDEX",
+        "### RECENT HISTORY TOOL RESULTS",
+        "### STATE — RECENT CONTROLLER ACTIONS",
+        "### STATE — LIVE CONTEXT",
+        "# Step: 1",
+    )
 
 
 def test_simple_prompt_includes_all_sections():
@@ -257,3 +273,62 @@ def test_simple_prompt_includes_all_sections():
     assert "### SKILL LIBRARY" in prompt
     assert "### SUBAGENT REGISTRY" in prompt
     assert "### LONG-TERM MEMORY OVERVIEW" in prompt
+    _assert_sections_in_order(
+        prompt,
+        "### SUBAGENT REGISTRY",
+        "### OBJECTIVES",
+        "### LONG-TERM MEMORY OVERVIEW",
+        "### SKILL LIBRARY",
+        "### STATE — SLOW-CHANGING CONTEXT",
+        "### SHORT-TERM MEMORY",
+        "### HISTORY CHRONOLOGY INDEX",
+        "### RECENT HISTORY TOOL RESULTS",
+        "### STATE — RECENT CONTROLLER ACTIONS",
+        "### STATE — LIVE CONTEXT",
+        "# Step: 1",
+    )
+
+
+def test_optimized_prompt_puts_volatile_step_context_last():
+    """Optimized prompts preserve a long reusable prefix between game steps."""
+    load_mock = MagicMock(return_value="SYS_BODY")
+    with patch.object(_POKE_MODULE, "MCPToolAdapter"), \
+         patch.object(_POKE_MODULE, "VLM"), \
+         patch.object(_POKE_MODULE, "get_run_data_manager") as m_rm:
+        m_rm.return_value = None
+        with patch.object(PokeAgent, "_load_system_instructions", load_mock):
+            agent = PokeAgent(server_url="http://localhost:8000", scaffold="pokeagent")
+
+    game_state = json.dumps({
+        "state_text": "STATE VALUE",
+        "objectives_mode": "legacy",
+        "direct_objective": "OBJECTIVE VALUE",
+        "direct_objective_status": "STATUS VALUE",
+        "direct_objective_context": "OBJECTIVE CONTEXT",
+    })
+
+    with patch.object(agent, "_load_base_prompt", return_value="STRATEGIC GUIDANCE"), \
+         patch.object(agent, "_format_action_history", return_value="HISTORY VALUE"), \
+         patch.object(agent, "_get_function_results_context", return_value="RESULT VALUE"), \
+         patch.object(agent, "_gather_store_context", return_value={
+             "memory": "MEMORY VALUE",
+             "skills": "SKILL VALUE",
+             "subagents": "SUBAGENT VALUE",
+         }):
+        prompt = agent._build_optimized_prompt(game_state, step_count=7)
+
+    _assert_sections_in_order(
+        prompt,
+        "STRATEGIC GUIDANCE",
+        "### SUBAGENT REGISTRY",
+        "### CURRENT DIRECT OBJECTIVE",
+        "### LONG-TERM MEMORY OVERVIEW",
+        "### SKILL LIBRARY",
+        "### CURRENT GAME STATE — SLOW-CHANGING CONTEXT",
+        "### ACTION HISTORY",
+        "### HISTORY CHRONOLOGY INDEX",
+        "### RECENT HISTORY TOOL RESULTS",
+        "### CURRENT GAME STATE — RECENT CONTROLLER ACTIONS",
+        "### CURRENT GAME STATE — LIVE CONTEXT",
+        "# Current Step: 7",
+    )

@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import json
+import re
 import logging
 import requests
 from pathlib import Path
@@ -94,6 +95,7 @@ logger = logging.getLogger(__name__)
 
 # Orchestrator short-term action history: slice size and prompt header must stay in sync
 ACTION_HISTORY_WINDOW = 20
+ACTION_HISTORY_RESULT_WINDOW = 3
 
 
 class MCPToolAdapter:
@@ -2462,6 +2464,102 @@ class PokeAgent:
             ctx["subagents"] = self._get_subagent_context()
         return ctx
 
+    @staticmethod
+    def _split_state_context(state_text: str) -> Dict[str, str]:
+        """Losslessly partition formatted state into cache-oriented blocks.
+
+        The formatter historically puts the ten most recent controller actions
+        first, ahead of slower-changing location and mode information.  Every
+        character is retained here; fragments are only moved between blocks.
+        Unknown/new formatter sections conservatively go into ``live``.
+        """
+        if not state_text:
+            return {"slow": "", "recent_actions": "", "live": ""}
+
+        slow_parts: List[str] = []
+        recent_parts: List[str] = []
+        live_parts: List[str] = []
+        heading_matches = list(re.finditer(r"(?m)^=== [^\n]+ ===\s*$", state_text))
+
+        preamble_end = heading_matches[0].start() if heading_matches else len(state_text)
+        preamble = state_text[:preamble_end]
+        recent_marker = preamble.find("RECENT ACTION HISTORY:")
+        if recent_marker >= 0:
+            live_parts.append(preamble[:recent_marker])
+            recent_parts.append(preamble[recent_marker:])
+        else:
+            live_parts.append(preamble)
+
+        for index, match in enumerate(heading_matches):
+            end = heading_matches[index + 1].start() if index + 1 < len(heading_matches) else len(state_text)
+            section = state_text[match.start():end]
+            heading = match.group(0).strip()
+
+            if heading in {"=== LOCATION INFO ===", "=== BATTLE MODE ==="}:
+                slow_parts.append(section)
+            elif heading == "=== PLAYER INFO ===":
+                # The trainer name is stable, while position, money, party,
+                # inventory, and UI details may change on any step.
+                markers = [
+                    section.find(marker)
+                    for marker in ("Position:", "Money:", "Pokemon Party", "Bag Inventory:")
+                    if section.find(marker) >= 0
+                ]
+                if markers:
+                    live_marker = min(markers)
+                    slow_parts.append(section[:live_marker])
+                    live_parts.append(section[live_marker:])
+                else:
+                    live_parts.append(section)
+            elif heading == "=== LOCATION & MAP INFO ===":
+                # Red only emits the current location here. Emerald may append
+                # player coordinates or a viewport, both of which are volatile.
+                markers = [
+                    section.find(marker)
+                    for marker in ("Player Position:", "--- MAP (viewport) ---")
+                    if section.find(marker) >= 0
+                ]
+                if markers:
+                    live_marker = min(markers)
+                    slow_parts.append(section[:live_marker])
+                    live_parts.append(section[live_marker:])
+                else:
+                    slow_parts.append(section)
+            elif heading in {"=== MAP (FULL) ===", "=== PORYMAP MAP LAYOUT ==="}:
+                # Location, dimensions, and the map heading are stable while the
+                # player stays on a map.  The ASCII overlay and JSON objects move.
+                live_marker = section.find("ASCII Map:")
+                if live_marker >= 0:
+                    slow_parts.append(section[:live_marker])
+                    live_parts.append(section[live_marker:])
+                else:
+                    live_parts.append(section)
+            elif heading == "=== BATTLE STATUS ===":
+                # Battle type/capture rules remain stable for a battle; HP, PP,
+                # opponent values, and menus belong in the live tail.
+                live_marker = section.find("--- YOUR POKÉMON ---")
+                if live_marker >= 0:
+                    slow_parts.append(section[:live_marker])
+                    live_parts.append(section[live_marker:])
+                else:
+                    live_parts.append(section)
+            elif heading == "=== GAME STATE ===":
+                # Dialogue, menus, mode, and the movement preview can all change
+                # on every action, so this whole section belongs in the tail.
+                live_parts.append(section)
+            else:
+                live_parts.append(section)
+
+        result = {
+            "slow": "".join(slow_parts),
+            "recent_actions": "".join(recent_parts),
+            "live": "".join(live_parts),
+        }
+        if sum(len(value) for value in result.values()) != len(state_text):
+            logger.warning("State partition was not lossless; using unsplit live state")
+            return {"slow": "", "recent_actions": "", "live": state_text}
+        return result
+
     def _build_optimized_prompt(self, game_state_result: str, step_count: int) -> str:
         """Build optimized prompt by combining base_prompt.md with current game context.
         
@@ -2494,6 +2592,11 @@ class PokeAgent:
         # Strip map information during title sequence
         if is_title_sequence:
             state_text = self._strip_map_info(state_text)
+
+        state_context = self._split_state_context(state_text)
+        slow_state_context = state_context["slow"] or "No slow-changing state context available."
+        recent_action_context = state_context["recent_actions"] or "No recent controller actions reported."
+        live_state_context = state_context["live"] or "No live state context available."
 
         # Check if we're in categorized mode
         objectives_mode = game_state_data.get("objectives_mode", "legacy")
@@ -2624,7 +2727,9 @@ class PokeAgent:
                 direct_objective_status = f"📊 PROGRESS: Objective {current_idx + 1}/{total} in sequence '{seq}' ({completed} completed)"
 
         # Build action history summary for better context
-        action_history = self._format_action_history()
+        action_history = self._format_action_history(include_recent_tool_results=False)
+        history_chronology = self._format_action_history_chronology()
+        history_tool_results = self._format_recent_history_tool_results()
 
         # Get function results from previous step
         function_results_context = self._get_function_results_context()
@@ -2641,7 +2746,12 @@ class PokeAgent:
         logger.info(f"📏 Pre-prompt component sizes:")
         logger.info(f"   base_prompt: {len(base_prompt):,} chars")
         logger.info(f"   state_text: {len(state_text):,} chars")
+        logger.info(f"     slow_state: {len(state_context['slow']):,} chars")
+        logger.info(f"     recent_controller_actions: {len(state_context['recent_actions']):,} chars")
+        logger.info(f"     live_state: {len(state_context['live']):,} chars")
         logger.info(f"   action_history: {len(action_history):,} chars")
+        logger.info(f"   history_chronology: {len(history_chronology):,} chars")
+        logger.info(f"   history_tool_results: {len(history_tool_results):,} chars")
         logger.info(f"   function_results: {len(function_results_context):,} chars")
         logger.info(f"   memory: {len(memory_context):,} chars")
         logger.info(f"   skills: {len(skill_context):,} chars")
@@ -2654,29 +2764,24 @@ class PokeAgent:
         if self.bootstrap_active:
             bootstrap_section = "\n" + self._load_bootstrap_addendum() + "\n"
 
-        # Build complete prompt by combining base prompt with context
-        prompt = f"""# Current Step: {step_count}
-
-{base_prompt}
+        # Keep the least-changing context first. Prefix-based prompt caches stop at
+        # the first differing token, so per-step state/history belongs at the end.
+        prompt = f"""{base_prompt}
 {bootstrap_section}
 ## CONTEXT FOR THIS STEP
 
-### ACTION HISTORY (last {ACTION_HISTORY_WINDOW} steps):
-{action_history}
-{function_results_context}
+### SUBAGENT REGISTRY
+{subagent_context}
 
 ### CURRENT DIRECT OBJECTIVE:
+⚠️ **CRITICAL**: When you complete the objective, IMMEDIATELY call:
+   complete_direct_objective(category="<story/battling/dynamics>", reasoning="<explain why it's complete>")
+
 {direct_objective_context}
 
 {direct_objective}
 
 {direct_objective_status}
-
-⚠️ **CRITICAL**: When you complete the objective, IMMEDIATELY call:
-   complete_direct_objective(category="<story/battling/dynamics>", reasoning="<explain why it's complete>")
-
-### CURRENT GAME STATE:
-{state_text}
 
 ### LONG-TERM MEMORY OVERVIEW
 {memory_context}
@@ -2684,22 +2789,49 @@ class PokeAgent:
 ### SKILL LIBRARY
 {skill_context}
 
-### SUBAGENT REGISTRY
-{subagent_context}
+### CURRENT GAME STATE — SLOW-CHANGING CONTEXT:
+{slow_state_context}
 
-Step {step_count}"""
+### ACTION HISTORY (last {ACTION_HISTORY_WINDOW} steps, fixed cache slots):
+{action_history}
+
+### HISTORY CHRONOLOGY INDEX
+{history_chronology}
+
+### RECENT HISTORY TOOL RESULTS
+{history_tool_results}
+{function_results_context}
+
+### CURRENT GAME STATE — RECENT CONTROLLER ACTIONS:
+{recent_action_context}
+
+### CURRENT GAME STATE — LIVE CONTEXT:
+{live_state_context}
+
+# Current Step: {step_count}"""
 
         # Log prompt size breakdown to debug token issues
         prompt_size = len(prompt)
         state_size = len(state_text)
         history_size = len(action_history)
+        history_chronology_size = len(history_chronology)
+        history_tool_results_size = len(history_tool_results)
         function_results_size = len(function_results_context)
         context_size = len(direct_objective_context)
         objective_size = len(str(direct_objective))
         status_size = len(direct_objective_status)
 
         # Calculate static instruction size (approximate)
-        dynamic_total = state_size + history_size + function_results_size + context_size + objective_size + status_size
+        dynamic_total = (
+            state_size
+            + history_size
+            + history_chronology_size
+            + history_tool_results_size
+            + function_results_size
+            + context_size
+            + objective_size
+            + status_size
+        )
         static_instructions = prompt_size - dynamic_total
 
         logger.info(f"📏 Final prompt size breakdown:")
@@ -2709,6 +2841,8 @@ Step {step_count}"""
         logger.info(f"   Dynamic content:")
         logger.info(f"     - State text: {state_size:,} chars")
         logger.info(f"     - Action history: {history_size:,} chars")
+        logger.info(f"     - History chronology: {history_chronology_size:,} chars")
+        logger.info(f"     - History tool results: {history_tool_results_size:,} chars")
         logger.info(f"     - Function results: {function_results_size:,} chars")
         logger.info(f"     - Objective context: {context_size:,} chars")
         logger.info(f"     - Objective: {objective_size:,} chars")
@@ -2739,6 +2873,11 @@ Step {step_count}"""
         # Strip map information during title sequence
         if is_title_sequence:
             state_text = self._strip_map_info(state_text)
+
+        state_context = self._split_state_context(state_text)
+        slow_state_context = state_context["slow"] or "No slow-changing state context available."
+        recent_action_context = state_context["recent_actions"] or "No recent controller actions reported."
+        live_state_context = state_context["live"] or "No live state context available."
 
         is_simplest = self.scaffold == _SIMPLEST_SCAFFOLD
 
@@ -2861,7 +3000,9 @@ Step {step_count}"""
                     direct_objective_status = f"📊 PROGRESS: Objective {current_idx + 1}/{total} in sequence '{seq}' ({completed} completed)"
 
         # --- Common context ---
-        action_history = self._format_action_history()
+        action_history = self._format_action_history(include_recent_tool_results=False)
+        history_chronology = self._format_action_history_chronology()
+        history_tool_results = self._format_recent_history_tool_results()
         function_results_context = self._get_function_results_context()
         store_ctx = self._gather_store_context()
         memory_context = store_ctx["memory"]
@@ -2878,33 +3019,68 @@ Step {step_count}"""
             bootstrap_block = "\n".join(parts) + "\n"
 
         # --- Assemble prompt (simplest gets a minimal layout) ---
+        # Order sections from least to most volatile. Both OpenAI prompt caching
+        # and llama.cpp LCP reuse depend on a shared exact prefix.
         if is_simplest:
-            prompt = f"""{bootstrap_block}# Step: {step_count}
-### SHORT-TERM MEMORY (last {ACTION_HISTORY_WINDOW} steps)
-{action_history}
-{function_results_context}
-### STATE
-{state_text}
-### LONG-TERM MEMORY OVERVIEW
+            prompt = f"""{bootstrap_block}### LONG-TERM MEMORY OVERVIEW
 {memory_context}
+
+### STATE — SLOW-CHANGING CONTEXT
+{slow_state_context}
+
+### SHORT-TERM MEMORY (last {ACTION_HISTORY_WINDOW} steps, fixed cache slots)
+{action_history}
+
+### HISTORY CHRONOLOGY INDEX
+{history_chronology}
+
+### RECENT HISTORY TOOL RESULTS
+{history_tool_results}
+{function_results_context}
+
+### STATE — RECENT CONTROLLER ACTIONS
+{recent_action_context}
+
+### STATE — LIVE CONTEXT
+{live_state_context}
+
+# Step: {step_count}
 """
         else:
-            prompt = f"""{bootstrap_block}# Step: {step_count}
-### SHORT-TERM MEMORY (last {ACTION_HISTORY_WINDOW} steps)
-{action_history}
-{function_results_context}
+            prompt = f"""{bootstrap_block}### SUBAGENT REGISTRY
+{subagent_context}
+
 ### OBJECTIVES
 {direct_objective_context}
 {direct_objective}
 {direct_objective_status}
-### STATE
-{state_text}
+
 ### LONG-TERM MEMORY OVERVIEW
 {memory_context}
+
 ### SKILL LIBRARY
 {skill_context}
-### SUBAGENT REGISTRY
-{subagent_context}
+
+### STATE — SLOW-CHANGING CONTEXT
+{slow_state_context}
+
+### SHORT-TERM MEMORY (last {ACTION_HISTORY_WINDOW} steps, fixed cache slots)
+{action_history}
+
+### HISTORY CHRONOLOGY INDEX
+{history_chronology}
+
+### RECENT HISTORY TOOL RESULTS
+{history_tool_results}
+{function_results_context}
+
+### STATE — RECENT CONTROLLER ACTIONS
+{recent_action_context}
+
+### STATE — LIVE CONTEXT
+{live_state_context}
+
+# Step: {step_count}
 """
 
         return prompt
@@ -3034,51 +3210,102 @@ Step {step_count}"""
             logger.error(f"Failed to log trajectory at step {step_num}: {e}")
             logger.error(traceback.format_exc())
 
-    def _format_action_history(self) -> str:
-        """Format short-term memory (last ACTION_HISTORY_WINDOW steps) with full tool details."""
+    @staticmethod
+    def _format_action_history_entry(entry: Dict[str, Any]) -> str:
+        """Format one history record without volatile tool-result payloads."""
+        step = entry.get("step", "?")
+        llm_response = entry.get("llm_response", "").strip()
+        start_coords = entry.get("start_coords")
+        end_coords = entry.get("end_coords")
+        coords = entry.get("player_coords")
+
+        if start_coords is None and coords is not None:
+            start_coords = coords
+        if end_coords is None:
+            end_coords = coords
+
+        start_str = f"({start_coords[0]},{start_coords[1]})" if start_coords else "(?)"
+        end_str = f"({end_coords[0]},{end_coords[1]})" if end_coords else "(?)"
+        lines = [f"[{step}] start={start_str} end={end_str}"]
+        if llm_response:
+            lines.append(f"  THINKING: {llm_response}")
+
+        tool_calls = entry.get("tool_calls", [])
+        if tool_calls:
+            lines.append("  TOOLS:")
+            for tool_call in tool_calls:
+                lines.append(f"    - {tool_call.get('name', 'unknown')}")
+                lines.append(
+                    f"      args: {json.dumps(tool_call.get('args', {}), ensure_ascii=False)}"
+                )
+        return "\n".join(lines)
+
+    def _format_recent_history_tool_results(self) -> str:
+        """Retain tool results for the newest records in a volatile tail block."""
+        recent_entries = self.conversation_history[-ACTION_HISTORY_RESULT_WINDOW:]
+        lines: List[str] = []
+        for entry in recent_entries:
+            step = entry.get("step", "?")
+            for tool_call in entry.get("tool_calls", []):
+                result = tool_call.get("result", "")
+                if result == "":
+                    continue
+                lines.append(f"[{step}] {tool_call.get('name', 'unknown')}")
+                try:
+                    lines.append(f"  result: {json.dumps(result, ensure_ascii=False)}")
+                except TypeError:
+                    lines.append(f"  result: {str(result)}")
+                lines.append("")
+        return "\n".join(lines).strip() or "No recent history tool results."
+
+    def _format_action_history_chronology(self) -> str:
+        """Give the model the chronological order without shifting cache slots."""
+        recent_entries = self.conversation_history[-ACTION_HISTORY_WINDOW:]
+        if not recent_entries:
+            return "No previous actions recorded."
+        steps = [f"[{entry.get('step', '?')}]" for entry in recent_entries]
+        return "Oldest → newest: " + " → ".join(steps)
+
+    def _format_action_history(self, include_recent_tool_results: bool = True) -> str:
+        """Format the same last 20 records in fixed cache slots.
+
+        Slot ``step % ACTION_HISTORY_WINDOW`` remains at a fixed prompt position.
+        Advancing the rolling window therefore replaces one block instead of
+        shifting all nineteen shared records. Step IDs preserve chronology.
+        """
         if not self.conversation_history:
             return "No previous actions recorded."
 
         recent_entries = self.conversation_history[-ACTION_HISTORY_WINDOW:]
+        slot_entries: List[List[Dict[str, Any]]] = [
+            [] for _ in range(ACTION_HISTORY_WINDOW)
+        ]
+        for fallback_index, entry in enumerate(recent_entries):
+            try:
+                slot = int(entry.get("step")) % ACTION_HISTORY_WINDOW
+            except (TypeError, ValueError):
+                slot = fallback_index % ACTION_HISTORY_WINDOW
+            # A list avoids losing malformed/legacy duplicate step IDs.
+            slot_entries[slot].append(entry)
 
-        history_lines = []
-        result_window_start = max(0, len(recent_entries) - 3)
-        for entry_index, entry in enumerate(recent_entries):
-            step = entry.get("step", "?")
-            llm_response = entry.get("llm_response", "").strip()
-            start_coords = entry.get("start_coords")
-            end_coords = entry.get("end_coords")
-            coords = entry.get("player_coords", None)
+        lines = [
+            "Records are stored in fixed cache slots, not chronological order;",
+            "use each record's [step] ID to reconstruct chronology.",
+        ]
+        for slot, entries in enumerate(slot_entries):
+            lines.append("")
+            lines.append(f"#### HISTORY SLOT {slot:02d}")
+            if not entries:
+                lines.append("(empty)")
+                continue
+            for entry in entries:
+                lines.append(self._format_action_history_entry(entry))
 
-            if start_coords is None and coords is not None:
-                start_coords = coords
-            if end_coords is None:
-                end_coords = coords
-
-            start_str = f"({start_coords[0]},{start_coords[1]})" if start_coords else "(?)"
-            end_str = f"({end_coords[0]},{end_coords[1]})" if end_coords else "(?)"
-
-            history_lines.append(f"[{step}] start={start_str} end={end_str}")
-            if llm_response:
-                history_lines.append(f"  THINKING: {llm_response}")
-
-            tool_calls = entry.get("tool_calls", [])
-            if tool_calls:
-                history_lines.append("  TOOLS:")
-                for tool_call in tool_calls:
-                    name = tool_call.get("name", "unknown")
-                    args = tool_call.get("args", {})
-                    result = tool_call.get("result", "")
-                    history_lines.append(f"    - {name}")
-                    history_lines.append(f"      args: {json.dumps(args, ensure_ascii=False)}")
-                    if result != "" and entry_index >= result_window_start:
-                        try:
-                            history_lines.append(f"      result: {json.dumps(result, ensure_ascii=False)}")
-                        except TypeError:
-                            history_lines.append(f"      result: {str(result)}")
-            history_lines.append("")
-
-        return "\n".join(history_lines).strip()
+        history = "\n".join(lines).strip()
+        if include_recent_tool_results:
+            history += "\n\n### RECENT HISTORY TOOL RESULTS\n"
+            history += self._format_recent_history_tool_results()
+        return history
 
     def run(self) -> int:
         """Run the autonomous agent loop."""
@@ -3144,6 +3371,10 @@ Step {step_count}"""
                     screenshot_b64 = game_state_data.get("screenshot_base64")
                 except:
                     screenshot_b64 = None
+
+                run_manager = get_run_data_manager()
+                if run_manager is not None:
+                    run_manager.save_step_screenshot(next_step, screenshot_b64)
 
                 # Build prompt (conditional based on optimization mode)
                 if self.optimization_enabled:
