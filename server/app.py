@@ -44,7 +44,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.anticheat import AntiCheatTracker
 from utils.json_utils import normalize_replan_edits
 from utils.llm_provider_ui import infer_llm_provider_family
-from server.timeline import discover_timeline_frames, resolve_timeline_frame, select_timeline_delta
+from server.timeline import (
+    discover_step_details,
+    discover_timeline_frames,
+    resolve_timeline_frame,
+    select_recent_step_details,
+    select_timeline_delta,
+)
 
 # Set up logging - reduced verbosity for multiprocess mode
 logging.basicConfig(level=logging.WARNING)
@@ -147,6 +153,17 @@ def _provider_family_for_llm_log_entry(entry: dict) -> str:
     meta = entry.get("metadata") or {}
     backend = meta.get("backend") or mi.get("backend")
     return infer_llm_provider_family(raw_type, model_name, backend)
+
+
+def _interaction_precedes_live_cursor(entry: dict, after_step: Optional[int]) -> bool:
+    """Whether an existing log row is already represented by hydrated history."""
+    entry_step = entry.get("agent_step")
+    if after_step is None or entry_step is None:
+        return True
+    try:
+        return int(entry_step) <= after_step
+    except (TypeError, ValueError):
+        return True
 
 
 # Performance monitoring
@@ -1123,6 +1140,37 @@ async def get_timeline_frame(step: int):
         media_type="image/png",
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )
+
+
+@app.get("/api/steps/recent")
+async def get_recent_step_history(limit: int = Query(default=25, ge=1, le=100)):
+    """Return completed reasoning/action records for live-view hydration."""
+    from utils.data_persistence.run_data_manager import get_run_data_manager
+
+    run_manager = get_run_data_manager()
+    if run_manager is None:
+        return {"run_id": None, "steps": [], "count": 0}
+    details = discover_step_details(run_manager.run_dir, run_manager.run_id)
+    recent = select_recent_step_details(details, limit)
+    return {
+        "run_id": run_manager.run_id,
+        "steps": recent,
+        "count": len(details),
+    }
+
+
+@app.get("/api/steps/{step}")
+async def get_step_history(step: int):
+    """Return reasoning and controller input for one saved logical step."""
+    from utils.data_persistence.run_data_manager import get_run_data_manager
+
+    run_manager = get_run_data_manager()
+    if run_manager is not None:
+        details = discover_step_details(run_manager.run_dir, run_manager.run_id)
+        detail = next((item for item in details if item["step"] == step), None)
+        if detail is not None:
+            return detail
+    raise HTTPException(status_code=404, detail=f"No completed reasoning for step {step}")
 
 
 # FastAPI endpoints
@@ -2207,7 +2255,7 @@ async def test_stream():
 
 
 @app.get("/agent_stream")
-async def stream_agent_thinking():
+async def stream_agent_thinking(after_step: Optional[int] = Query(default=None, ge=0)):
     """Stream agent thinking in real-time using Server-Sent Events"""
     from fastapi.responses import StreamingResponse
     from utils.data_persistence.llm_logger import get_llm_logger
@@ -2225,9 +2273,9 @@ async def stream_agent_thinking():
             # Send initial connection message
             yield f"data: {json.dumps({'status': 'connected', 'timestamp': time.time()})}\n\n"
 
-            # On startup, mark all existing interactions as "sent" to avoid flooding with old messages
-            # We only want to stream NEW interactions from this point forward
-            # Use current session's log file only (not glob of all files - avoids cross-execution bleed)
+            # The client preloads persisted steps, then passes the newest one as
+            # after_step. Leave newer session rows unsent so a step that finishes
+            # between history fetch and SSE connection cannot disappear in a race.
             try:
                 log_file = llm_logger.log_file
                 if log_file and os.path.exists(log_file):
@@ -2237,7 +2285,7 @@ async def stream_agent_thinking():
                                 entry = json.loads(line.strip())
                                 if entry.get("type") == "interaction":
                                     timestamp = entry.get("timestamp", "")
-                                    if timestamp:
+                                    if timestamp and _interaction_precedes_live_cursor(entry, after_step):
                                         sent_timestamps.add(timestamp)
                             except Exception:
                                 continue

@@ -160,6 +160,13 @@
             box-shadow: var(--shadow);
         }
 
+        .viewer-content {
+            min-width: 0;
+            min-height: 320px;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(310px, 410px);
+        }
+
         .viewer-toolbar {
             min-height: 50px;
             display: flex;
@@ -230,6 +237,84 @@
             cursor: ew-resize;
             touch-action: pan-y;
         }
+
+        .step-detail {
+            min-width: 0;
+            display: grid;
+            grid-template-rows: auto minmax(0, 1fr) auto;
+            border-left: 1px solid var(--line);
+            background: linear-gradient(180deg, rgba(23, 29, 25, .98), rgba(9, 13, 10, .98));
+        }
+
+        .detail-heading {
+            padding: 14px 16px 12px;
+            border-bottom: 1px solid var(--line);
+        }
+
+        .detail-title {
+            margin-top: 5px;
+            color: var(--green);
+            font-size: .92rem;
+            font-weight: 700;
+            letter-spacing: .05em;
+        }
+
+        .detail-meta {
+            margin-top: 6px;
+            color: var(--muted);
+            font-size: .68rem;
+            line-height: 1.5;
+        }
+
+        .detail-analysis {
+            min-height: 160px;
+            margin: 0;
+            padding: 16px;
+            overflow: auto;
+            color: #d7e9db;
+            font-family: inherit;
+            font-size: .78rem;
+            line-height: 1.65;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+
+        .detail-analysis.is-muted { color: var(--muted); }
+
+        .detail-actions {
+            min-height: 88px;
+            padding: 12px 16px 15px;
+            border-top: 1px solid var(--line);
+        }
+
+        .action-label {
+            display: block;
+            margin-bottom: 8px;
+            color: var(--pink);
+            font-size: .68rem;
+            font-weight: 700;
+            letter-spacing: .1em;
+            text-transform: uppercase;
+        }
+
+        .action-chips { display: flex; flex-wrap: wrap; gap: 7px; }
+        .key-chip, .tool-chip {
+            display: inline-flex;
+            align-items: center;
+            min-height: 28px;
+            padding: 4px 8px;
+            border: 1px solid var(--line);
+            background: #080c09;
+            font-size: .7rem;
+            letter-spacing: .06em;
+        }
+        .key-chip {
+            border-color: var(--green);
+            color: var(--green-soft);
+            box-shadow: inset 0 -2px 0 rgba(53, 255, 105, .16);
+        }
+        .tool-chip { color: var(--amber); border-color: #6a5730; }
+        .no-actions { color: var(--muted); font-size: .72rem; }
 
         .frame-stage::after {
             content: "SCROLL / DRAG TIMELINE / ← →";
@@ -482,6 +567,12 @@
             .frame-stage { padding: 18px 10px; }
             .frame-stage::after { display: none; }
             .toolbar-actions .download-link { display: none; }
+            .viewer-content { grid-template-columns: 1fr; }
+            .step-detail {
+                grid-template-rows: auto minmax(150px, 280px) auto;
+                border-left: 0;
+                border-top: 1px solid var(--line);
+            }
         }
 
         @media (max-width: 520px) {
@@ -526,13 +617,28 @@
                 </div>
             </div>
 
-            <div id="frame-stage" class="frame-stage" tabindex="0" aria-label="Timeline image; use the mouse wheel or arrow keys to move">
-                <img id="frame-image" class="frame-image" alt="Saved game screenshot" draggable="false">
-                <div id="empty-state" class="empty-state">
-                    <strong>WAITING FOR SAVED FRAMES</strong>
-                    Screenshots appear here as the agent starts each step. This page checks automatically, so it can stay open during the run.
+            <div class="viewer-content">
+                <div id="frame-stage" class="frame-stage" tabindex="0" aria-label="Timeline image; use the mouse wheel or arrow keys to move">
+                    <img id="frame-image" class="frame-image" alt="Saved game screenshot" draggable="false">
+                    <div id="empty-state" class="empty-state">
+                        <strong>WAITING FOR SAVED FRAMES</strong>
+                        Screenshots appear here as the agent starts each step. This page checks automatically, so it can stay open during the run.
+                    </div>
+                    <div class="loading-sheen"></div>
                 </div>
-                <div class="loading-sheen"></div>
+
+                <aside class="step-detail" aria-label="Selected step reasoning and controller inputs">
+                    <div class="detail-heading">
+                        <div class="eyebrow">Agent decision</div>
+                        <div id="detail-title" class="detail-title">STEP —</div>
+                        <div id="detail-meta" class="detail-meta">Select a saved frame to inspect its reasoning.</div>
+                    </div>
+                    <pre id="detail-analysis" class="detail-analysis is-muted">Reasoning will appear after the selected agent step completes.</pre>
+                    <div class="detail-actions">
+                        <span class="action-label">Controller input</span>
+                        <div id="detail-actions" class="action-chips"><span class="no-actions">No input recorded yet.</span></div>
+                    </div>
+                </aside>
             </div>
 
             <div class="viewer-footer">
@@ -615,6 +721,10 @@
             follow: document.getElementById('follow-toggle'),
             filmstrip: document.getElementById('filmstrip'),
             savedCount: document.getElementById('saved-count'),
+            detailTitle: document.getElementById('detail-title'),
+            detailMeta: document.getElementById('detail-meta'),
+            detailAnalysis: document.getElementById('detail-analysis'),
+            detailActions: document.getElementById('detail-actions'),
             toast: document.getElementById('toast')
         };
 
@@ -627,6 +737,9 @@
         let touchStartX = null;
         let toastTimer = null;
         let initialLoad = true;
+        let detailRequestNumber = 0;
+        let detailAbortController = null;
+        const detailCache = new Map();
 
         const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
         const currentFrame = () => frames[currentIndex] || null;
@@ -666,6 +779,95 @@
 
         function setLoading(loading) {
             dom.stage.classList.toggle('is-loading', loading);
+        }
+
+        function formatDetailMeta(detail) {
+            const parts = [];
+            if (detail.location) {
+                const coords = Array.isArray(detail.player_coords)
+                    ? ` (${detail.player_coords[0]}, ${detail.player_coords[1]})`
+                    : '';
+                parts.push(`${detail.location}${coords}`);
+            }
+            if (detail.timestamp) {
+                const parsed = new Date(detail.timestamp);
+                parts.push(Number.isNaN(parsed.getTime()) ? detail.timestamp : parsed.toLocaleString());
+            }
+            return parts.join('  •  ') || 'Completed agent step';
+        }
+
+        function renderDetailActions(detail) {
+            dom.detailActions.replaceChildren();
+            const buttons = Array.isArray(detail?.buttons) ? detail.buttons : [];
+            buttons.forEach(button => {
+                const chip = document.createElement('span');
+                chip.className = 'key-chip';
+                chip.textContent = button;
+                dom.detailActions.appendChild(chip);
+            });
+
+            const calls = Array.isArray(detail?.tool_calls) ? detail.tool_calls : [];
+            calls.filter(call => call?.name && call.name !== 'press_buttons').forEach(call => {
+                const chip = document.createElement('span');
+                chip.className = 'tool-chip';
+                chip.textContent = call.name.replaceAll('_', ' ').toUpperCase();
+                dom.detailActions.appendChild(chip);
+            });
+
+            if (!dom.detailActions.children.length) {
+                const empty = document.createElement('span');
+                empty.className = 'no-actions';
+                empty.textContent = 'No controller input recorded for this step.';
+                dom.detailActions.appendChild(empty);
+            }
+        }
+
+        function renderStepDetail(detail, step) {
+            dom.detailTitle.textContent = `STEP ${step}`;
+            dom.detailAnalysis.classList.toggle('is-muted', !detail);
+            if (!detail) {
+                dom.detailMeta.textContent = 'This frame was saved before the model replied.';
+                dom.detailAnalysis.textContent = 'Reasoning will appear here when this agent step completes.';
+                renderDetailActions(null);
+                return;
+            }
+            dom.detailMeta.textContent = formatDetailMeta(detail);
+            dom.detailAnalysis.textContent = detail.analysis || 'The step completed without textual analysis.';
+            renderDetailActions(detail);
+        }
+
+        async function loadStepDetail(step) {
+            if (detailCache.has(step)) {
+                renderStepDetail(detailCache.get(step), step);
+                return;
+            }
+            const requestNumber = ++detailRequestNumber;
+            if (detailAbortController) detailAbortController.abort();
+            detailAbortController = new AbortController();
+            dom.detailTitle.textContent = `STEP ${step}`;
+            dom.detailMeta.textContent = 'Loading saved decision…';
+            dom.detailAnalysis.classList.add('is-muted');
+            dom.detailAnalysis.textContent = 'Fetching analysis and controller input for this frame.';
+            renderDetailActions(null);
+            try {
+                const response = await fetch(`/api/steps/${step}`, {
+                    cache: 'no-store',
+                    signal: detailAbortController.signal
+                });
+                if (requestNumber !== detailRequestNumber) return;
+                if (response.status === 404) {
+                    renderStepDetail(null, step);
+                    return;
+                }
+                if (!response.ok) throw new Error(`Step API returned ${response.status}`);
+                const detail = await response.json();
+                detailCache.set(step, detail);
+                if (requestNumber === detailRequestNumber) renderStepDetail(detail, step);
+            } catch (error) {
+                if (error.name === 'AbortError') return;
+                console.error(error);
+                if (requestNumber === detailRequestNumber) renderStepDetail(null, step);
+            }
         }
 
         function updateControls() {
@@ -779,6 +981,7 @@
             updateControls();
             renderFilmstrip();
             preloadNeighbors();
+            loadStepDetail(frame.step);
         }
 
         async function refreshTimeline() {
@@ -829,6 +1032,20 @@
                     setEmpty(true);
                     updateControls();
                     renderFilmstrip();
+                    return;
+                }
+
+                // A normal three-second poll usually contains no changes. Do
+                // not rebuild/recenter the filmstrip in that case: replacing
+                // its children resets the native scrollbar and makes it appear
+                // to drift left on every refresh. A pending decision is still
+                // retried independently so its analysis can appear when ready.
+                if (!initialLoad && !changed) {
+                    updateControls();
+                    const selected = currentFrame();
+                    if (selected && !detailCache.has(selected.step)) {
+                        loadStepDetail(selected.step);
+                    }
                     return;
                 }
 

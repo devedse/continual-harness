@@ -1,13 +1,17 @@
 import base64
+import json
 from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from server.app import app
+from server.app import _interaction_precedes_live_cursor, app
 from server.timeline import (
+    discover_step_details,
     discover_timeline_frames,
+    normalize_step_detail,
     resolve_timeline_frame,
+    select_recent_step_details,
     select_timeline_delta,
 )
 from utils.data_persistence.run_data_manager import RunDataManager
@@ -150,3 +154,122 @@ def test_timeline_polling_uses_incremental_index_parameters():
     assert "indexUrl.searchParams.set('known_count'" in page
     assert "indexUrl.searchParams.set('client_run_id'" in page
     assert "if (data.incremental && !data.reset)" in page
+
+
+def test_unchanged_timeline_poll_does_not_recenter_the_filmstrip():
+    page = Path("server/timeline.html").read_text(encoding="utf-8")
+
+    unchanged_guard = page.index("if (!initialLoad && !changed)")
+    selection_restore = page.index("if (initialLoad)", unchanged_guard)
+    guarded_block = page[unchanged_guard:selection_restore]
+
+    assert "updateControls()" in guarded_block
+    assert "loadStepDetail(selected.step)" in guarded_block
+    assert "return;" in guarded_block
+    assert "renderFilmstrip()" not in guarded_block
+
+
+def test_step_detail_normalizes_reasoning_buttons_and_tools():
+    detail = normalize_step_detail(
+        {
+            "step": 42,
+            "timestamp": "2026-08-31T10:00:00",
+            "reasoning": "Inspect the menu, then confirm.",
+            "location": "Route1",
+            "player_coords": [3, 7],
+            "action": {
+                "tool_calls": [
+                    {"name": "press_buttons", "args": {"buttons": ["down", "A"]}},
+                    {"name": "process_memory", "args": {"action": "read"}},
+                ]
+            },
+        }
+    )
+
+    assert detail["analysis"] == "Inspect the menu, then confirm."
+    assert detail["buttons"] == ["DOWN", "A"]
+    assert detail["tool_calls"] == [
+        {"name": "press_buttons", "buttons": ["DOWN", "A"]},
+        {"name": "process_memory", "buttons": []},
+    ]
+    assert detail["player_coords"] == [3, 7]
+
+
+def test_step_history_uses_latest_retry_and_returns_bounded_tail(tmp_path):
+    trajectory = tmp_path / "trajectory_history.jsonl"
+    rows = [
+        {"step": 1, "reasoning": "first", "action": {}},
+        {"step": 2, "reasoning": "old attempt", "action": {}},
+        {
+            "step": 2,
+            "reasoning": "successful retry",
+            "action": {"tool_calls": [{"name": "press_buttons", "args": {"buttons": ["A"]}}]},
+        },
+        {"step": 3, "reasoning": "third", "action": {}},
+    ]
+    trajectory.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    details = discover_step_details(tmp_path)
+
+    assert [detail["step"] for detail in details] == [1, 2, 3]
+    assert details[1]["analysis"] == "successful retry"
+    assert select_recent_step_details(details, 2) == details[-2:]
+
+
+def test_step_history_api_preloads_recent_and_lazy_loads_one_step(tmp_path):
+    manager = RunDataManager(run_id="history-test", base_dir=str(tmp_path))
+    rows = [
+        {
+            "step": step,
+            "reasoning": f"analysis {step}",
+            "action": {"tool_calls": [{"name": "press_buttons", "args": {"buttons": ["A"]}}]},
+        }
+        for step in range(1, 31)
+    ]
+    (manager.run_dir / "trajectory_history.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    client = TestClient(app)
+
+    with patch(
+        "utils.data_persistence.run_data_manager.get_run_data_manager",
+        return_value=manager,
+    ):
+        recent_response = client.get("/api/steps/recent?limit=25")
+        detail_response = client.get("/api/steps/12")
+        missing_response = client.get("/api/steps/99")
+
+    assert recent_response.status_code == 200
+    assert recent_response.json()["count"] == 30
+    assert [row["step"] for row in recent_response.json()["steps"]] == list(range(6, 31))
+    assert detail_response.json()["analysis"] == "analysis 12"
+    assert detail_response.json()["buttons"] == ["A"]
+    assert missing_response.status_code == 404
+
+
+def test_timeline_lazily_loads_selected_step_details():
+    page = Path("server/timeline.html").read_text(encoding="utf-8")
+
+    assert 'class="step-detail"' in page
+    assert "fetch(`/api/steps/${step}`" in page
+    assert "detailAbortController.abort()" in page
+    assert "loadStepDetail(frame.step)" in page
+
+
+def test_live_view_hydrates_history_and_pairs_keypresses_with_steps():
+    page = Path("server/stream.html").read_text(encoding="utf-8")
+
+    assert "/api/steps/recent?limit=${maxAgentMessages}" in page
+    assert "maxAgentMessages = 25" in page
+    assert "renderStepActions" in page
+    assert "initializeAgentStreaming(newestPersistedStep)" in page
+    assert "after_step" in page
+    assert "agentThinkingDiv.innerHTML" not in page
+
+
+def test_live_stream_cursor_does_not_drop_a_step_completed_during_hydration():
+    assert _interaction_precedes_live_cursor({"agent_step": 25}, 25) is True
+    assert _interaction_precedes_live_cursor({"agent_step": 26}, 25) is False
+    assert _interaction_precedes_live_cursor({"agent_step": None}, 25) is True
+    assert _interaction_precedes_live_cursor({"agent_step": 26}, None) is True

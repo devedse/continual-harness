@@ -585,6 +585,59 @@
             margin-top: 5px;
         }
 
+        .llm-actions {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 6px;
+            margin-top: 8px;
+        }
+
+        .llm-action-label {
+            color: #ff6177;
+            font-size: 11px;
+            font-weight: bold;
+            letter-spacing: 0.08em;
+        }
+
+        .llm-key-chip,
+        .llm-tool-chip {
+            display: inline-flex;
+            align-items: center;
+            min-height: 24px;
+            padding: 2px 7px;
+            border: 1px solid #33ff33;
+            background: #071008;
+            color: #8cffaa;
+            font-size: 12px;
+            letter-spacing: 0.05em;
+            box-shadow: inset 0 -2px 0 rgba(51, 255, 51, 0.16);
+        }
+
+        .llm-tool-chip {
+            border-color: #8b7138;
+            color: #ffc857;
+            box-shadow: none;
+        }
+
+        .llm-no-actions { color: #777; font-size: 12px; font-style: italic; }
+
+        .stream-status {
+            position: sticky;
+            top: 0;
+            z-index: 2;
+            margin-bottom: 8px;
+            padding: 5px 8px;
+            border: 1px solid #34523c;
+            background: rgba(7, 12, 8, 0.96);
+            color: #ffa500;
+            font-size: 12px;
+            font-style: italic;
+            text-align: center;
+        }
+        .stream-status.connected { color: #33ff33; }
+        .stream-status.disconnected { color: #ff6177; }
+
         .status-message {
             color: #ffa500;
             font-style: italic;
@@ -772,7 +825,9 @@
         <div class="brain-panel">
             <div class="brain-section">
                 <div class="section-title"># AGENT_THINKING</div>
-                <div id="agent-thinking" class="agent-thinking">INITIALIZING AGENT...</div>
+                <div id="agent-thinking" class="agent-thinking">
+                    <div id="agent-stream-status" class="stream-status">LOADING RECENT AGENT STEPS…</div>
+                </div>
             </div>
 
             <div class="brain-section">
@@ -1164,167 +1219,243 @@
                 .replace(/[^a-z]/g, '') || 'other';
         }
         
-        function initializeAgentStreaming() {
-            const agentThinkingDiv = document.getElementById('agent-thinking');
-            
-            // Close existing connection if any
-            if (streamingSource) {
-                streamingSource.close();
+        const maxAgentMessages = 25;
+        const agentCardsByStep = new Map();
+
+        function streamStatusElement() {
+            let status = document.getElementById('agent-stream-status');
+            if (!status) {
+                status = document.createElement('div');
+                status.id = 'agent-stream-status';
+                status.className = 'stream-status';
+                document.getElementById('agent-thinking').prepend(status);
             }
-            
-            // Create new EventSource connection
-            streamingSource = new EventSource(`${serverUrl}/agent_stream`);
-            
-            streamingSource.onopen = function(event) {
+            return status;
+        }
+
+        function setAgentStreamStatus(text, state = '') {
+            const status = streamStatusElement();
+            status.textContent = text;
+            status.className = `stream-status${state ? ` ${state}` : ''}`;
+        }
+
+        function formatStepMeta(detail, fallback = '') {
+            const parts = [];
+            if (detail?.location) {
+                const coords = Array.isArray(detail.player_coords)
+                    ? ` (${detail.player_coords[0]}, ${detail.player_coords[1]})`
+                    : '';
+                parts.push(`${detail.location}${coords}`);
+            }
+            if (detail?.timestamp) {
+                const parsed = new Date(detail.timestamp);
+                parts.push(Number.isNaN(parsed.getTime()) ? detail.timestamp : parsed.toLocaleString());
+            }
+            if (fallback) parts.push(fallback);
+            return parts.join(' • ');
+        }
+
+        function renderStepActions(container, detail) {
+            container.replaceChildren();
+            const label = document.createElement('span');
+            label.className = 'llm-action-label';
+            label.textContent = 'KEYS';
+            container.appendChild(label);
+
+            const buttons = Array.isArray(detail?.buttons) ? detail.buttons : [];
+            buttons.forEach(button => {
+                const chip = document.createElement('span');
+                chip.className = 'llm-key-chip';
+                chip.textContent = button;
+                container.appendChild(chip);
+            });
+
+            const calls = Array.isArray(detail?.tool_calls) ? detail.tool_calls : [];
+            calls.filter(call => call?.name && call.name !== 'press_buttons').forEach(call => {
+                const chip = document.createElement('span');
+                chip.className = 'llm-tool-chip';
+                chip.textContent = call.name.replaceAll('_', ' ').toUpperCase();
+                container.appendChild(chip);
+            });
+
+            if (container.children.length === 1) {
+                const empty = document.createElement('span');
+                empty.className = 'llm-no-actions';
+                empty.textContent = detail ? 'No controller input' : 'Waiting for action record…';
+                container.appendChild(empty);
+            }
+        }
+
+        function trimAgentCards() {
+            const container = document.getElementById('agent-thinking');
+            const cards = Array.from(container.querySelectorAll('.llm-entry'));
+            cards.slice(0, Math.max(0, cards.length - maxAgentMessages)).forEach(card => {
+                agentCardsByStep.delete(Number(card.dataset.step));
+                card.remove();
+            });
+        }
+
+        function upsertAgentCard(detail, options = {}) {
+            const container = document.getElementById('agent-thinking');
+            const step = Number(detail.step);
+            let card = agentCardsByStep.get(step);
+            if (!card) {
+                card = document.createElement('div');
+                card.dataset.step = String(step);
+                const stepLabel = document.createElement('div');
+                stepLabel.className = 'llm-step';
+                const message = document.createElement('div');
+                message.className = 'llm-message';
+                const actions = document.createElement('div');
+                actions.className = 'llm-actions';
+                const meta = document.createElement('div');
+                meta.className = 'llm-meta';
+                card.append(stepLabel, message, actions, meta);
+                container.appendChild(card);
+                agentCardsByStep.set(step, card);
+            }
+
+            const provider = sanitizeProviderFamily(
+                options.type || 'trajectory',
+                options.model || '',
+                options.providerFamily || 'other'
+            );
+            card.className = `llm-entry ${options.streaming ? 'streaming' : 'complete'} provider-${provider}`;
+            card.querySelector('.llm-step').textContent = `Step ${step}:`;
+            if (!options.deferMessage) {
+                card.querySelector('.llm-message').textContent = detail.analysis || 'No textual analysis recorded.';
+            }
+            renderStepActions(card.querySelector('.llm-actions'), detail);
+            const modelLabel = options.model ? ` [${options.model}]` : '';
+            const duration = Number.isFinite(options.duration) ? ` (${options.duration.toFixed(2)}s)` : '';
+            const sourceMeta = options.type ? `${options.type}${modelLabel}${duration}` : '';
+            card.dataset.sourceMeta = sourceMeta;
+            card.querySelector('.llm-meta').textContent = formatStepMeta(detail, sourceMeta);
+            trimAgentCards();
+            return card;
+        }
+
+        async function hydrateStepCard(step, attempt = 0) {
+            try {
+                const response = await fetch(`${serverUrl}/api/steps/${step}`, {cache: 'no-store'});
+                if (response.status === 404) {
+                    if (attempt < 4) setTimeout(() => hydrateStepCard(step, attempt + 1), 1200 * (attempt + 1));
+                    return;
+                }
+                if (!response.ok) throw new Error(`Step API returned ${response.status}`);
+                const detail = await response.json();
+                const card = agentCardsByStep.get(Number(step));
+                if (!card) return;
+                renderStepActions(card.querySelector('.llm-actions'), detail);
+                card.querySelector('.llm-meta').textContent = formatStepMeta(detail, card.dataset.sourceMeta || '');
+            } catch (error) {
+                console.error('Error hydrating step actions:', error);
+            }
+        }
+
+        async function loadRecentAgentHistory() {
+            const container = document.getElementById('agent-thinking');
+            try {
+                const response = await fetch(`${serverUrl}/api/steps/recent?limit=${maxAgentMessages}`, {cache: 'no-store'});
+                if (!response.ok) throw new Error(`Recent steps API returned ${response.status}`);
+                const data = await response.json();
+                container.querySelectorAll('.llm-entry').forEach(card => card.remove());
+                agentCardsByStep.clear();
+                const steps = Array.isArray(data.steps) ? data.steps : [];
+                steps.forEach(detail => upsertAgentCard(detail));
+                container.scrollTop = container.scrollHeight;
+                return steps.length ? Math.max(...steps.map(detail => Number(detail.step) || 0)) : 0;
+            } catch (error) {
+                console.error('Error loading recent agent history:', error);
+                setAgentStreamStatus('COULD NOT LOAD HISTORY — LIVE STREAM WILL STILL CONNECT', 'disconnected');
+                return 0;
+            }
+        }
+
+        function initializeAgentStreaming(afterStep = 0) {
+            const agentThinkingDiv = document.getElementById('agent-thinking');
+            if (streamingSource) streamingSource.close();
+
+            const streamUrl = new URL(`${serverUrl}/agent_stream`);
+            if (afterStep > 0) streamUrl.searchParams.set('after_step', String(afterStep));
+            streamingSource = new EventSource(streamUrl);
+
+            streamingSource.onopen = function() {
                 console.log('Agent streaming connected');
-                agentThinkingDiv.innerHTML = '<div class="status-message">Agent streaming connected...</div>';
+                setAgentStreamStatus('AGENT STREAM CONNECTED', 'connected');
             };
-            
+
             streamingSource.onmessage = function(event) {
                 try {
                     const data = JSON.parse(event.data);
-                    
                     if (data.error) {
                         console.error('Streaming error:', data.error);
                         return;
                     }
-                    
-                    // Ignore heartbeat messages
-                    if (data.heartbeat) {
-                        return;
-                    }
-                    
-                    // Only process new messages
-                    if (!data.is_new) {
-                        return;
-                    }
-                    
+                    if (data.heartbeat || !data.is_new) return;
+
                     console.log('New agent message received:', data.step);
-                    
-                    // Create new message element
-                    const modelLabel = data.model ? ` [${data.model}]` : '';
-                    const pf = sanitizeProviderFamily(data.type, data.model, data.provider_family);
-                    const messageDiv = document.createElement('div');
-                    messageDiv.className = `llm-entry streaming provider-${pf}`;
-                    messageDiv.innerHTML = `
-                        <div class="llm-step">Step ${data.step}:</div>
-                        <div class="llm-message" id="streaming-message-${data.step}-${Date.now()}"></div>
-                        <div class="llm-meta">${data.type}${modelLabel} (${data.duration?.toFixed(2)}s)</div>
-                    `;
-                    
-                    // Add to container
-                    agentThinkingDiv.appendChild(messageDiv);
-
-                    // Limit DOM size - keep only last 20 messages for performance
-                    const maxMessages = 20;
-                    const messages = agentThinkingDiv.querySelectorAll('.llm-entry');
-                    if (messages.length > maxMessages) {
-                        // Remove oldest messages
-                        const toRemove = messages.length - maxMessages;
-                        for (let i = 0; i < toRemove; i++) {
-                            messages[i].remove();
-                        }
-                    }
-
-                    // Display response text with smooth streaming (optimized for performance)
-                    const messageElement = messageDiv.querySelector('.llm-message');
+                    const detail = {
+                        step: data.step,
+                        analysis: '',
+                        buttons: [],
+                        tool_calls: [],
+                        timestamp: data.timestamp || ''
+                    };
+                    const card = upsertAgentCard(detail, {
+                        type: data.type,
+                        model: data.model,
+                        providerFamily: data.provider_family,
+                        duration: Number(data.duration),
+                        streaming: true,
+                        deferMessage: true
+                    });
+                    const messageElement = card.querySelector('.llm-message');
+                    messageElement.textContent = '';
                     const responseText = data.response || '';
-
-                    // Streaming animation that batches updates to avoid FPS drops
                     let charIndex = 0;
-                    const charsPerFrame = 5; // Show 5 characters per frame for smooth streaming
-                    const frameDelay = 16; // ~60 FPS (16ms per frame)
+                    const charsPerFrame = 5;
 
                     function streamChunk() {
                         if (charIndex < responseText.length) {
-                            // Add multiple characters at once (batched update)
-                            const nextChunk = responseText.substring(charIndex, charIndex + charsPerFrame);
-                            messageElement.textContent += nextChunk;
+                            messageElement.textContent += responseText.substring(charIndex, charIndex + charsPerFrame);
                             charIndex += charsPerFrame;
-
-                            // Use requestAnimationFrame for smooth, FPS-friendly updates
                             requestAnimationFrame(() => {
-                                // Only scroll every few frames to reduce layout thrashing
                                 if (charIndex % (charsPerFrame * 3) === 0) {
                                     agentThinkingDiv.scrollTop = agentThinkingDiv.scrollHeight;
                                 }
-                                setTimeout(streamChunk, frameDelay);
+                                setTimeout(streamChunk, 16);
                             });
                         } else {
-                            // Message complete - final scroll
                             agentThinkingDiv.scrollTop = agentThinkingDiv.scrollHeight;
-                            messageDiv.classList.remove('streaming');
-                            messageDiv.classList.add('complete');
+                            card.classList.remove('streaming');
+                            card.classList.add('complete');
                         }
                     }
 
                     streamChunk();
-                    
+                    hydrateStepCard(data.step);
                 } catch (error) {
                     console.error('Error parsing streaming data:', error);
                 }
             };
-            
+
             streamingSource.onerror = function(event) {
                 console.error('Agent streaming error:', event);
-                agentThinkingDiv.innerHTML = '<div class="error-message">Agent streaming disconnected. Retrying...</div>';
-                
-                // Retry connection after delay
-                setTimeout(() => {
-                    initializeAgentStreaming();
-                }, 5000);
+                setAgentStreamStatus('AGENT STREAM DISCONNECTED — RETRYING', 'disconnected');
+                // EventSource reconnects automatically and keeps the existing cards visible.
             };
         }
-        
-        // Fallback function for non-streaming updates
+
+        async function initializeAgentExperience() {
+            const newestPersistedStep = await loadRecentAgentHistory();
+            initializeAgentStreaming(newestPersistedStep);
+        }
+
+        // Fallback refresh for environments where SSE cannot remain connected.
         async function updateAgentThinking() {
-            // Only use fallback if streaming is not available
-            if (streamingSource && streamingSource.readyState === EventSource.OPEN) {
-                return;
-            }
-            
-            try {
-                const response = await fetch(`${serverUrl}/agent`);
-                const data = await response.json();
-                
-                const agentThinkingDiv = document.getElementById('agent-thinking');
-                
-                if (data.recent_interactions && data.recent_interactions.length > 0) {
-                    // Format all LLM interactions in condensed format: "Step X: <msg>"
-                    let html = '';
-                    data.recent_interactions.forEach((interaction, index) => {
-                        const baseStep = data.current_step || 0;
-                        const stepNumber = (interaction.agent_step != null && interaction.agent_step !== '')
-                            ? interaction.agent_step
-                            : baseStep;
-                        
-                        // Trim whitespace from the response
-                        const trimmedResponse = interaction.response.trim();
-                        const modelLabel = interaction.model ? ` [${interaction.model}]` : '';
-                        const pf = sanitizeProviderFamily(
-                            interaction.type,
-                            interaction.model,
-                            interaction.provider_family
-                        );
-                        
-                        html += `<div class="llm-entry complete provider-${pf}">
-                            <div class="llm-step">Step ${stepNumber}:</div>
-                            <div class="llm-message">${trimmedResponse}</div>
-                            <div class="llm-meta">${interaction.type || 'unknown'}${modelLabel}</div>
-                        </div>`;
-                    });
-                    agentThinkingDiv.innerHTML = html;
-                    
-                    // Auto-scroll to bottom to show most recent
-                    agentThinkingDiv.scrollTop = agentThinkingDiv.scrollHeight;
-                } else {
-                    agentThinkingDiv.textContent = data.current_thought || 'No recent LLM interactions';
-                }
-                
-            } catch (error) {
-                console.error('Error fetching agent thinking:', error);
-                document.getElementById('agent-thinking').textContent = 'Error loading agent thinking';
-            }
+            if (streamingSource && streamingSource.readyState === EventSource.OPEN) return;
+            await loadRecentAgentHistory();
         }
 
         // Function to fetch and update recent actions
@@ -1748,8 +1879,8 @@
         // Frame updates are now handled by WebSocket (real-time push)
         // No polling needed!
 
-        // Initialize streaming for agent thinking
-        initializeAgentStreaming();
+        // Hydrate persisted reasoning first, then continue with live SSE updates.
+        initializeAgentExperience();
 
         // Set up periodic updates for other components - optimized frequencies
         setInterval(() => {
